@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-"""Train the MLP coordinator with sep-CMA-ES, then evaluate against heuristic.
+"""Train the coordinator with sep-CMA-ES or RS baseline, then evaluate.
+
+Reproduces the S4.8 comparison from the paper (RS vs sep-CMA-ES) on the
+toy task suite, plus a head-architecture ablation (linear / block_diag / mlp).
 
 Usage:
-    python examples/train_router.py            # quick run
-    python examples/train_router.py --gens 30 --pop 16 --train 24
+    python examples/train_router.py                          # quick run
+    python examples/train_router.py --gens 20 --pop 16
+    python examples/train_router.py --head block_diag --argmax
+    python examples/train_router.py --method rs --gens 20    # RS baseline
+    python examples/train_router.py --ablate                 # head ablation
 """
 
 from __future__ import annotations
 import argparse
-import json
 import os
 import sys
 import time
@@ -17,8 +22,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 
-from src.coordinator import HeuristicCoordinator, MLPCoordinator
-from src.evolution import train_router
+from src.coordinator import HeuristicCoordinator, MLPCoordinator, CoordinatorConfig
+from src.evolution import (
+    train_router, random_search, CMAESConfig, make_fitness_fn,
+    recommended_pop_size,
+)
 from src.eval import compare
 from src.llm_pool import LLMPool
 from src.tasks import make_dataset
@@ -27,63 +35,78 @@ from src.tasks import make_dataset
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gens", type=int, default=15)
-    ap.add_argument("--pop", type=int, default=12)
-    ap.add_argument("--train", type=int, default=12, help="training tasks per gen")
-    ap.add_argument("--eval", type=int, default=24, help="held-out eval tasks")
-    ap.add_argument("--max-turns", type=int, default=6)
-    ap.add_argument("--hidden", type=int, default=32)
+    ap.add_argument("--pop", type=int, default=None,
+                    help="population size (default: paper formula ⌈4+3 ln n⌉)")
+    ap.add_argument("--train", type=int, default=16)
+    ap.add_argument("--eval", type=int, default=32)
+    ap.add_argument("--max-turns", type=int, default=5,
+                    help="paper default K=5")
+    ap.add_argument("--head", type=str, default="block_diag",
+                    choices=["linear", "low_rank", "sparse", "block_diag", "mlp"])
+    ap.add_argument("--n-blocks", type=int, default=None,
+                    help="block-diag blocks (default = n_outputs)")
+    ap.add_argument("--argmax", action="store_true", default=True,
+                    help="use argmax output (paper's best for block_diag)")
+    ap.add_argument("--no-argmax", dest="argmax", action="store_false")
+    ap.add_argument("--method", type=str, default="cma",
+                    choices=["cma", "rs"],
+                    help="training algorithm: sep-CMA-ES or random search")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--save", type=str, default="artifacts/router_params.json")
+    ap.add_argument("--ablate", action="store_true",
+                    help="run a head-architecture ablation instead of comparison")
     args = ap.parse_args()
 
     pool = LLMPool()
 
     t0 = time.time()
-    best_params, logs = train_router(
+    best, logs, coord_cfg = train_router(
         pool,
         n_train=args.train,
         n_eval=args.eval,
         pop_size=args.pop,
         generations=args.gens,
         max_turns=args.max_turns,
-        hidden=args.hidden,
+        head=args.head,
+        n_blocks=args.n_blocks or 5,
+        use_argmax=args.argmax,
+        method=args.method,
         seed=args.seed,
         save_path=args.save,
     )
     train_time = time.time() - t0
 
-    print(f"\n=== Training done in {train_time:.1f}s ===")
+    print(f"\n=== {args.method.upper()} training done in {train_time:.1f}s ===")
+    print(f"Head: {args.head} (n_blocks={coord_cfg.n_blocks}, argmax={args.argmax})")
     print(f"Final train fitness: {logs[-1].best:.3f}")
 
-    # ---- compare on held-out ----
+    # ---- held-out evaluation ----
     eval_tasks = make_dataset(args.eval, seed=args.seed + 9999, difficulty_range=(1, 5))
 
     def make_mlp():
-        c = MLPCoordinator(params=best_params, deterministic=True)
-        return c
+        return MLPCoordinator(params=best, cfg=coord_cfg)
 
     def make_heur():
         return HeuristicCoordinator()
 
     def make_random_mlp():
-        c = MLPCoordinator(deterministic=True)
-        return c
+        return MLPCoordinator(cfg=coord_cfg)
 
     print("\n=== Comparison on held-out tasks ===")
     reports = compare(
         [
             ("heuristic", make_heur),
-            ("mlp-untrained", make_random_mlp),
-            ("mlp-trained", make_mlp),
+            (f"{args.head}-untrained", make_random_mlp),
+            (f"{args.head}-trained-{args.method}", make_mlp),
         ],
-        "trained vs heuristic",
+        f"{args.method} on {args.head}",
         eval_tasks,
         pool,
         max_turns=args.max_turns,
     )
     print("\nSummary:")
     for r in reports:
-        print(f"  {r.name:20s}  acc={r.accuracy:.0%}  accept={r.accept_rate:.0%}  "
+        print(f"  {r.name:32s}  acc={r.accuracy:.0%}  accept={r.accept_rate:.0%}  "
               f"avg_turns={r.avg_turns:.2f}")
 
 

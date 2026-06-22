@@ -1,4 +1,12 @@
-"""Coordinator implementations: heuristic, MLP, Qwen (stub)."""
+"""Coordinator implementations: heuristic, learned (any head), Qwen (stub).
+
+The paper (Appendix A.4) studies 4 head architectures:
+    linear, low_rank, sparse, block_diag
+The block-diagonal-10 head + argmax output is the most parameter-efficient.
+
+This module exposes a unified `MLPCoordinator` that picks any of those heads
+behind the same `route(turn, transcript, task)` interface.
+"""
 
 from __future__ import annotations
 from dataclasses import dataclass
@@ -16,6 +24,7 @@ from .features import (
     extract_features,
     label_to_action,
 )
+from .heads import HeadConfig, make_head
 
 
 # ------------------------------------------------------------------
@@ -49,58 +58,42 @@ class HeuristicCoordinator:
 
 
 # ------------------------------------------------------------------
-# MLP router — the "small linear head" of the paper
+# Learned coordinator with paper-faithful head architectures
 # ------------------------------------------------------------------
 
-class MLPRouter(nn.Module):
-    """Tiny MLP mapping transcript features -> (model_logits, role_logits).
-
-    Default config: 16 -> 32 -> 32 -> (2+3) = ~1.4K params, well under the
-    paper's ~10K linear head. Easy to scale up via width.
-    """
-
-    def __init__(self, in_dim: int = FEATURE_DIM, hidden: int = 32,
-                 n_models: int = 2, n_roles: int = NUM_ROLES):
-        super().__init__()
-        self.body = nn.Sequential(
-            nn.Linear(in_dim, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
-        )
-        self.model_head = nn.Linear(hidden, n_models)
-        self.role_head = nn.Linear(hidden, n_roles)
-        self.in_dim = in_dim
-        self.hidden = hidden
-        self.n_models = n_models
-        self.n_roles = n_roles
-
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        h = self.body(x)
-        return self.model_head(h), self.role_head(h)
-
-    def num_parameters(self) -> int:
-        return sum(p.numel() for p in self.parameters())
-
-
 @dataclass
-class MLPCoordinatorConfig:
+class CoordinatorConfig:
     in_dim: int = FEATURE_DIM
-    hidden: int = 32
-    n_models: int = 2
-    n_roles: int = NUM_ROLES
+    n_models: int = 2       # L
+    n_roles: int = NUM_ROLES  # 3
+    n_outputs: int = 5      # n_a = L + 3
+    hidden: int = 32        # used by low_rank and mlp
+    head: str = "block_diag"  # linear / low_rank / sparse / block_diag / mlp
+    n_blocks: int = 5       # for block_diag; set to n_outputs for full block-diag
+    use_argmax: bool = True  # paper's best for block_diag-10 uses argmax
+    temperature: float = 1.0
+    deterministic: bool = True
 
 
 class MLPCoordinator:
-    """Wraps an MLPRouter with the same interface as HeuristicCoordinator."""
+    """Coordinator with any of the 4 paper head architectures.
 
-    def __init__(self, params: np.ndarray | None = None, cfg: MLPCoordinatorConfig | None = None,
-                 temperature: float = 1.0, deterministic: bool = False):
-        self.cfg = cfg or MLPCoordinatorConfig()
-        self.net = MLPRouter(self.cfg.in_dim, self.cfg.hidden,
-                             self.cfg.n_models, self.cfg.n_roles)
-        self.temperature = temperature
-        self.deterministic = deterministic
+    By default, uses `block_diag` (5 blocks for n_a=5) + `argmax` output,
+    mirroring the paper's block-diagonal-10 + argmax configuration (scaled
+    down for n_a=5 here).
+    """
+
+    def __init__(self, params: np.ndarray | None = None,
+                 cfg: CoordinatorConfig | None = None):
+        self.cfg = cfg or CoordinatorConfig()
+        head_cfg = HeadConfig(
+            in_dim=self.cfg.in_dim,
+            n_outputs=self.cfg.n_outputs,
+            hidden=self.cfg.hidden,
+            kind=self.cfg.head,
+            n_blocks=self.cfg.n_blocks,
+        )
+        self.head = make_head(head_cfg)
         self.history: list[str] = []
         if params is not None:
             self.set_params(params)
@@ -108,20 +101,20 @@ class MLPCoordinator:
     # --- parameter access (CMA-ES friendly) ---
     def get_params(self) -> np.ndarray:
         out = []
-        for p in self.net.parameters():
+        for p in self.head.parameters():
             out.append(p.detach().cpu().numpy().ravel())
         return np.concatenate(out).astype(np.float32)
 
     def set_params(self, flat: np.ndarray) -> None:
         i = 0
         with torch.no_grad():
-            for p in self.net.parameters():
+            for p in self.head.parameters():
                 n = p.numel()
                 p.copy_(torch.from_numpy(flat[i:i + n].reshape(p.shape)))
                 i += n
 
     def num_parameters(self) -> int:
-        return self.net.num_parameters()
+        return self.head.num_parameters()
 
     def reset(self):
         self.history = []
@@ -130,15 +123,17 @@ class MLPCoordinator:
     def route(self, turn: int, transcript: list[dict], task=None,
               max_turns: int = 6) -> tuple[str, str]:
         x = torch.from_numpy(extract_features(transcript, task, max_turns)).unsqueeze(0)
-        m_logits, r_logits = self.net(x)
-        m_logits = m_logits / max(self.temperature, 1e-3)
-        r_logits = r_logits / max(self.temperature, 1e-3)
-        if self.deterministic:
-            m_idx = int(m_logits.argmax(dim=-1).item())
-            r_idx = int(r_logits.argmax(dim=-1).item())
+        z = self.head(x).squeeze(0)  # (n_a,)
+        z = z / max(self.cfg.temperature, 1e-3)
+        n_models = self.cfg.n_models
+        model_logits = z[:n_models]
+        role_logits = z[n_models:]
+        if self.cfg.use_argmax:
+            m_idx = int(model_logits.argmax().item())
+            r_idx = int(role_logits.argmax().item())
         else:
-            m_probs = torch.softmax(m_logits, dim=-1)
-            r_probs = torch.softmax(r_logits, dim=-1)
+            m_probs = torch.softmax(model_logits, dim=-1)
+            r_probs = torch.softmax(role_logits, dim=-1)
             m_idx = int(torch.multinomial(m_probs, 1).item())
             r_idx = int(torch.multinomial(r_probs, 1).item())
         choice = label_to_action(m_idx, r_idx)
@@ -151,24 +146,26 @@ class MLPCoordinator:
 # ------------------------------------------------------------------
 
 class QwenCoordinator:
-    """Coordinator that uses a small Qwen model's last hidden state + linear head.
+    """Coordinator that uses a small Qwen model's hidden state + linear head.
 
-    Faithful to the paper's Section 4 design, but kept pluggable so the rest of
-    the pipeline doesn't depend on a 0.6B checkpoint being present.
-
-    Use case: extract hidden state from a local Qwen2-0.5B-Instruct (close
-    substitute for the unavailable Qwen-0.6B) and train a linear head.
+    Faithful to the paper's Section 3 design. Use Qwen2-0.5B as a stand-in
+    for the unavailable Qwen3-0.6B. Head uses Linear by default (paper's
+    most stable architecture).
     """
 
     def __init__(self, model_name: str = "Qwen/Qwen2-0.5B-Instruct",
-                 head_hidden: int = 64, n_models: int = 2, n_roles: int = NUM_ROLES,
+                 head: str = "block_diag", n_blocks: int = 10,
+                 use_argmax: bool = True, n_models: int = 7, n_roles: int = 3,
                  device: str | None = None):
         self.model_name = model_name
         self.n_models = n_models
         self.n_roles = n_roles
+        self.n_outputs = n_models + n_roles
         self._loaded = False
-        self.head: nn.Module | None = None
-        self.head_hidden = head_hidden
+        self.head_module: nn.Module | None = None
+        self.head_kind = head
+        self.n_blocks = n_blocks
+        self.use_argmax = use_argmax
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
     def load(self):
@@ -177,12 +174,13 @@ class QwenCoordinator:
         from transformers import AutoModel, AutoTokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         self.backbone = AutoModel.from_pretrained(self.model_name).to(self.device).eval()
-        hidden = self.backbone.config.hidden_size
-        self.head = nn.Sequential(
-            nn.Linear(hidden, self.head_hidden),
-            nn.GELU(),
-            nn.Linear(self.head_hidden, self.n_models + self.n_roles),
-        ).to(self.device).eval()
+        head_cfg = HeadConfig(
+            in_dim=self.backbone.config.hidden_size,
+            n_outputs=self.n_outputs,
+            kind=self.head_kind,
+            n_blocks=self.n_blocks,
+        )
+        self.head_module = make_head(head_cfg).to(self.device).eval()
         self._loaded = True
 
     @torch.no_grad()
@@ -190,25 +188,32 @@ class QwenCoordinator:
               max_turns: int = 6) -> tuple[str, str]:
         self.load()
         text = "\n".join(f"{m['role']}: {m['content']}" for m in transcript)
-        inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=2048).to(self.device)
+        inputs = self.tokenizer(text, return_tensors="pt", truncation=True,
+                                max_length=2048).to(self.device)
         out = self.backbone(**inputs)
-        h = out.last_hidden_state[:, -1, :]  # last token
-        logits = self.head(h)
-        m_logits, r_logits = logits[..., :self.n_models], logits[..., self.n_models:]
-        m_idx = int(m_logits.argmax(dim=-1).item())
-        r_idx = int(r_logits.argmax(dim=-1).item())
+        h = out.last_hidden_state[:, -1, :]  # last token (paper allows earlier)
+        z = self.head_module(h).squeeze(0)
+        n_models = self.n_models
+        model_logits = z[:n_models]
+        role_logits = z[n_models:]
+        if self.use_argmax:
+            m_idx = int(model_logits.argmax().item())
+            r_idx = int(role_logits.argmax().item())
+        else:
+            m_idx = int(torch.softmax(model_logits, -1).argmax().item())
+            r_idx = int(torch.softmax(role_logits, -1).argmax().item())
         return label_to_action(m_idx, r_idx)
 
     def num_parameters(self) -> int:
         if not self._loaded:
             return 0
-        return sum(p.numel() for p in self.head.parameters())
+        return sum(p.numel() for p in self.head_module.parameters())
 
     def get_params(self) -> np.ndarray:
         if not self._loaded:
             return np.zeros(0, dtype=np.float32)
         out = []
-        for p in self.head.parameters():
+        for p in self.head_module.parameters():
             out.append(p.detach().cpu().numpy().ravel())
         return np.concatenate(out).astype(np.float32)
 
@@ -217,7 +222,7 @@ class QwenCoordinator:
             return
         i = 0
         with torch.no_grad():
-            for p in self.head.parameters():
+            for p in self.head_module.parameters():
                 n = p.numel()
                 p.copy_(torch.from_numpy(flat[i:i + n].reshape(p.shape)).to(self.device))
                 i += n

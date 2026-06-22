@@ -60,6 +60,55 @@ class GenerationLog:
     candidates: list[float] = field(default_factory=list)
 
 
+def random_search(cfg: CMAESConfig, init_params: np.ndarray,
+                  on_generation: Callable[[GenerationLog], None] | None = None,
+                  log_every: int = 1, verbose: bool = True) -> np.ndarray:
+    """Random search baseline (paper Section 4.8 / Table 4).
+
+    Same total budget as sep-CMA-ES per the paper's protocol: m_CMA=16,
+    m_RS=32, so each gen the RS baseline evaluates 2x more candidates but
+    no recombination. We just use the per-gen best.
+    """
+    d = cfg.n_dim
+    pop = cfg.pop_size * 2  # m_RS = 2 * m_CMA  (paper's protocol)
+    mean = init_params.astype(np.float64).copy()
+    rng = np.random.default_rng(1)
+
+    best_so_far = -np.inf
+    best_params = mean.copy()
+
+    for gen in range(cfg.generations):
+        t0 = time.time()
+        # RS samples from a fixed prior around the initial mean
+        Z = rng.standard_normal((pop, d))
+        X = mean + cfg.sigma_init * Z
+        fits = np.array([cfg.fitness_fn(x.astype(np.float32)) for x in X], dtype=np.float64)
+        order = np.argsort(-fits)
+        if fits[order[0]] > best_so_far:
+            best_so_far = fits[order[0]]
+            best_params = X[order[0]].astype(np.float32).copy()
+        elapsed = time.time() - t0
+        log = GenerationLog(
+            gen=gen,
+            best=float(fits[order[0]]),
+            mean=float(fits.mean()),
+            worst=float(fits[order[-1]]),
+            sigma_mean=cfg.sigma_init,
+            elapsed_s=elapsed,
+            candidates=[float(f) for f in fits],
+        )
+        if verbose and (gen % log_every == 0 or gen == cfg.generations - 1):
+            print(
+                f"[RS gen {gen:02d}] best={log.best:.3f} mean={log.mean:.3f} ({elapsed:.1f}s)"
+            )
+        if on_generation is not None:
+            on_generation(log)
+    return best_params
+
+
+# placeholder for clarity in on_generation callback name above
+
+
 def sep_cma_es(cfg: CMAESConfig, init_params: np.ndarray,
                on_generation: Callable[[GenerationLog], None] | None = None,
                log_every: int = 1, verbose: bool = True) -> np.ndarray:
@@ -159,7 +208,8 @@ def sep_cma_es(cfg: CMAESConfig, init_params: np.ndarray,
 
 def make_fitness_fn(tasks: list[Task], pool: LLMPool, max_turns: int = 6,
                     rollouts_per_candidate: int = 1,
-                    use_early_bonus: bool = True):
+                    use_early_bonus: bool = True,
+                    coord_cfg: "CoordinatorConfig | None" = None):
     """Build a fitness function for a fixed task batch.
 
     Fitness combines:
@@ -169,8 +219,11 @@ def make_fitness_fn(tasks: list[Task], pool: LLMPool, max_turns: int = 6,
 
     Each task is rolled out exactly once per candidate for noise reduction.
     """
+    from .coordinator import MLPCoordinator, CoordinatorConfig
+    coord_cfg = coord_cfg or CoordinatorConfig()
+
     def fitness(params: np.ndarray) -> float:
-        coord = MLPCoordinator(params=params, deterministic=True)
+        coord = MLPCoordinator(params=params, cfg=coord_cfg)
         system = TrinitySystem(coord, pool, max_turns=max_turns)
         score = 0.0
         for t in tasks:
@@ -189,29 +242,38 @@ def make_fitness_fn(tasks: list[Task], pool: LLMPool, max_turns: int = 6,
     return fitness
 
 
-def train_router(pool: LLMPool, n_train: int = 16, n_eval: int = 32,
-                 pop_size: int = 16, generations: int = 20, max_turns: int = 6,
-                 hidden: int = 32, seed: int = 0,
-                 save_path: str | None = None) -> tuple[np.ndarray, list[GenerationLog]]:
-    """Train an MLP router with sep-CMA-ES on synthetic tasks.
+def recommended_pop_size(n_dim: int) -> int:
+    """Paper's formula: lambda = ceil(4 + 3 ln n). For n=10240, lambda=32."""
+    import math
+    return max(4, math.ceil(4 + 3 * math.log(max(2, n_dim))))
 
-    Returns:
-        best_params, list of generation logs
-    """
-    from .coordinator import MLPCoordinatorConfig
-    cfg = MLPCoordinatorConfig(hidden=hidden)
-    # initial mean = default init of MLPRouter
-    init_coord = MLPCoordinator(cfg=cfg)
+
+def train_router(pool: LLMPool, n_train: int = 16, n_eval: int = 32,
+                 pop_size: int | None = None, generations: int = 20,
+                 max_turns: int = 6, hidden: int = 32, seed: int = 0,
+                 head: str = "block_diag", n_blocks: int = 5,
+                 use_argmax: bool = True,
+                 method: str = "cma",
+                 save_path: str | None = None) -> tuple[np.ndarray, list[GenerationLog], "CoordinatorConfig"]:
+    """Train a router with sep-CMA-ES (or RS baseline) on synthetic tasks."""
+    from .coordinator import MLPCoordinator, CoordinatorConfig
+    coord_cfg = CoordinatorConfig(
+        hidden=hidden,
+        head=head,
+        n_blocks=n_blocks,
+        use_argmax=use_argmax,
+    )
+    init_coord = MLPCoordinator(cfg=coord_cfg)
     init = init_coord.get_params()
     d = init.size
-    print(f"Training MLP router: d={d} params, pop={pop_size}, gen={generations}, "
-          f"tasks={n_train}, max_turns={max_turns}")
+    if pop_size is None:
+        pop_size = recommended_pop_size(d)
+    print(f"Training {head} router ({n_blocks} blocks, argmax={use_argmax}, "
+          f"d={d} params): pop={pop_size}, gen={generations}, tasks={n_train}, "
+          f"max_turns={max_turns}, method={method}")
 
     train_tasks = make_dataset(n_train, seed=seed, difficulty_range=(1, 4))
-    eval_tasks = make_dataset(n_eval, seed=seed + 9999, difficulty_range=(1, 5))
-
-    fit_fn = make_fitness_fn(train_tasks, pool, max_turns=max_turns)
-
+    fit_fn = make_fitness_fn(train_tasks, pool, max_turns=max_turns, coord_cfg=coord_cfg)
     logs: list[GenerationLog] = []
 
     def on_gen(log: GenerationLog):
@@ -224,13 +286,21 @@ def train_router(pool: LLMPool, n_train: int = 16, n_eval: int = 32,
         generations=generations,
         fitness_fn=fit_fn,
     )
-    best = sep_cma_es(es_cfg, init, on_generation=on_gen, verbose=True)
+    if method == "cma":
+        best = sep_cma_es(es_cfg, init, on_generation=on_gen, verbose=True)
+    elif method == "rs":
+        best = random_search(es_cfg, init, on_generation=on_gen, verbose=True)
+    else:
+        raise ValueError(f"unknown method: {method}")
 
     if save_path is not None:
         import json
         with open(save_path, "w") as f:
             json.dump({
                 "params": best.tolist(),
+                "head": head,
+                "n_blocks": n_blocks,
+                "use_argmax": use_argmax,
                 "hidden": hidden,
                 "d": d,
                 "n_train": n_train,
@@ -239,13 +309,13 @@ def train_router(pool: LLMPool, n_train: int = 16, n_eval: int = 32,
                 "generations": generations,
                 "max_turns": max_turns,
                 "seed": seed,
+                "method": method,
                 "fitness_train_final": logs[-1].best if logs else None,
             }, f)
         print(f"Saved params to {save_path}")
-        # also dump per-generation log next to it
         log_path = save_path.replace(".json", "_log.json")
         with open(log_path, "w") as f:
             json.dump([lg.__dict__ for lg in logs], f, indent=2)
         print(f"Saved training log to {log_path}")
 
-    return best, logs
+    return best, logs, coord_cfg
