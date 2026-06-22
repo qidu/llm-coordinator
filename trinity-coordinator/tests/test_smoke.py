@@ -4,6 +4,7 @@ from __future__ import annotations
 import sys
 import os
 import numpy as np
+import torch
 
 # allow running as plain script
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -18,6 +19,7 @@ from src.trinity_system import TrinitySystem
 from src.features import extract_features, FEATURE_DIM
 from src.heads import make_head, HeadConfig
 from src.evolution import random_search, recommended_pop_size
+from src.qwen_router import QwenCoordinator, QwenCoordinatorConfig
 
 
 def test_task_generation():
@@ -133,18 +135,24 @@ def test_mlp_with_different_heads():
 
 
 def test_argmax_vs_softmax():
-    """Argmax mode should be deterministic across calls."""
-    import torch
-    pool = LLMPool()
-    cfg_softmax = CoordinatorConfig(use_argmax=False, deterministic=False)
+    """Argmax mode should be deterministic across calls (same coord, no param
+    mutation in between). Mock LLM randomness is shared, so test on the
+    coordinator's output directly."""
+    pool = LLMPool(MockSmallLLM(seed=42), MockStrongLLM(seed=43))
     cfg_argmax = CoordinatorConfig(use_argmax=True, deterministic=True)
-    c_soft = MLPCoordinator(cfg=cfg_softmax)
     c_arg = MLPCoordinator(cfg=cfg_argmax)
-    # run twice, should be identical under deterministic argmax
-    t = make_task()
-    r1 = TrinitySystem(c_arg, pool, max_turns=3).solve(t)
-    r2 = TrinitySystem(c_arg, pool, max_turns=3).solve(t)
-    assert r1.decisions == r2.decisions
+    # run twice with same coord object, decisions should match
+    decisions1 = []
+    decisions2 = []
+    c_arg.reset()
+    for turn in range(1, 4):
+        d, _ = c_arg.route(turn, [{"role": "user", "content": "Q"}])
+        decisions1.append(d)
+    c_arg.reset()
+    for turn in range(1, 4):
+        d, _ = c_arg.route(turn, [{"role": "user", "content": "Q"}])
+        decisions2.append(d)
+    assert decisions1 == decisions2, f"{decisions1} != {decisions2}"
 
 
 def test_recommended_pop_size():
@@ -166,6 +174,101 @@ def test_random_search_runs():
     es_cfg = CMAESConfig(n_dim=init.size, pop_size=4, generations=2, fitness_fn=fit)
     best = random_search(es_cfg, init, verbose=False)
     assert best.shape == init.shape
+
+
+def test_qwen_router_loads_and_features():
+    """Smoke test: load Qwen3-0.6B-Base, extract a hidden state, run head.
+
+    Skipped automatically if the backbone isn't downloaded yet.
+    """
+    from pathlib import Path
+    cache_dir = Path.home() / ".cache/huggingface/hub/models--Qwen--Qwen3-0.6B-Base/snapshots"
+    if not cache_dir.exists():
+        print("SKIP  test_qwen_router_loads_and_features (model not downloaded)")
+        return
+    snapshots = list(cache_dir.glob("*/model.safetensors"))
+    if not snapshots:
+        print("SKIP  test_qwen_router_loads_and_features (safetensors not yet downloaded)")
+        return
+
+    from src.qwen_router import QwenCoordinator, QwenCoordinatorConfig
+    from src.llm_pool import LLMPool
+    cfg = QwenCoordinatorConfig(
+        model_id="Qwen/Qwen3-0.6B-Base",
+        head="linear",
+        n_outputs=6,  # 2 models * 3 roles
+        use_argmax=False,
+        device="cpu",
+        dtype=torch.float32,
+    )
+    coord = QwenCoordinator(cfg=cfg, deterministic=True)
+    pool = LLMPool()
+    coord.configure_outputs(pool.keys, ["Thinker", "Worker", "Verifier"])
+
+    # extract a feature
+    h = coord.router.features("What is 2+2?\nassistant: The answer is 4.")
+    assert h.shape == (1024,), f"hidden state shape: {h.shape}"
+
+    # round-trip params
+    p = coord.get_params()
+    assert p.shape[0] == 1024 * 6
+    coord.set_params(np.zeros_like(p))
+    p2 = coord.get_params()
+    assert np.allclose(p2, 0)
+
+    # .act() should return (model_idx, role)
+    act = coord.act("Question: how many vowels in 'trinity'?")
+    assert act[0] in (0, 1)
+    assert act[1] in ("Thinker", "Worker", "Verifier")
+
+
+def test_qwen_router_with_fake_backbone():
+    """Test the QwenRouter API end-to-end with a fake backbone (no download)."""
+    import src.qwen_router as qr
+
+    class FakeBackbone:
+        class cfg:
+            hidden_size = 1024
+            num_hidden_layers = 28
+        def __call__(self, **kwargs):
+            from types import SimpleNamespace
+            h = torch.zeros(1, 5, 1024)
+            h[0, -1, :] = 1.0
+            return SimpleNamespace(hidden_states=[h] * 29)
+
+    class FakeTok:
+        def __call__(self, text, **kw):
+            return {"input_ids": torch.tensor([[1, 2, 3, 4, 5]])}
+
+    original = qr.load_qwen3
+    qr.load_qwen3 = lambda *a, **kw: (FakeBackbone(), FakeTok(), 1024, 28)
+    try:
+        cfg = QwenCoordinatorConfig(head="linear", n_outputs=6,
+                                    device="cpu", use_argmax=False)
+        coord = QwenCoordinator(cfg=cfg, deterministic=True)
+        pool = LLMPool()
+        coord.configure_outputs(pool.keys, ["Thinker", "Worker", "Verifier"])
+        # touch a feature to lazy-load
+        _ = coord.router.features("warm up")
+        assert coord.num_parameters() == 1024 * 6, coord.num_parameters()
+        # round-trip
+        p = coord.get_params()
+        coord.set_params(np.zeros_like(p))
+        assert np.allclose(coord.get_params(), 0)
+        # act produces a valid pair
+        m, r = coord.act("Q: hi")
+        assert m in (0, 1)
+        assert r in ("Thinker", "Worker", "Verifier")
+        # different head kinds
+        for head in ("low_rank", "sparse", "block_diag", "mlp"):
+            cfg2 = QwenCoordinatorConfig(head=head, n_outputs=6,
+                                        device="cpu", use_argmax=False)
+            coord2 = QwenCoordinator(cfg=cfg2)
+            coord2.configure_outputs(pool.keys, ["Thinker", "Worker", "Verifier"])
+            _ = coord2.router.features("warm up")
+            assert coord2.num_parameters() > 0
+    finally:
+        qr.load_qwen3 = original
 
 
 if __name__ == "__main__":

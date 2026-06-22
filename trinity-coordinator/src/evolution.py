@@ -209,7 +209,8 @@ def sep_cma_es(cfg: CMAESConfig, init_params: np.ndarray,
 def make_fitness_fn(tasks: list[Task], pool: LLMPool, max_turns: int = 6,
                     rollouts_per_candidate: int = 1,
                     use_early_bonus: bool = True,
-                    coord_cfg: "CoordinatorConfig | None" = None):
+                    coord_cfg: "CoordinatorConfig | None" = None,
+                    coord_factory: "Callable[[np.ndarray], object] | None" = None):
     """Build a fitness function for a fixed task batch.
 
     Fitness combines:
@@ -218,12 +219,21 @@ def make_fitness_fn(tasks: list[Task], pool: LLMPool, max_turns: int = 6,
         - role-diversity bonus (small, prevents degenerate 'Worker only' policy)
 
     Each task is rolled out exactly once per candidate for noise reduction.
+
+    coord_factory(params) -> Coordinator is the optional explicit hook
+    (used by the Qwen router so we don't re-instantiate the heavy backbone
+    on every CMA-ES candidate). If omitted, defaults to MLPCoordinator.
     """
     from .coordinator import MLPCoordinator, CoordinatorConfig
     coord_cfg = coord_cfg or CoordinatorConfig()
 
+    def make_coord(params: np.ndarray):
+        if coord_factory is not None:
+            return coord_factory(params)
+        return MLPCoordinator(params=params, cfg=coord_cfg)
+
     def fitness(params: np.ndarray) -> float:
-        coord = MLPCoordinator(params=params, cfg=coord_cfg)
+        coord = make_coord(params)
         system = TrinitySystem(coord, pool, max_turns=max_turns)
         score = 0.0
         for t in tasks:
