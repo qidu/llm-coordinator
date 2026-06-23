@@ -282,6 +282,107 @@ def test_qwen_router_with_fake_backbone():
         qr.load_qwen3 = original
 
 
+# NOTE: if __name__ == "__main__" runner block intentionally stays at the
+# END of this file so it can discover all test_* functions defined below.
+
+
+# ------------------------------------------------------------------
+# Tests for the batched feature extractor + batched fitness
+# ------------------------------------------------------------------
+
+def test_extract_hidden_state_batch():
+    """features_batch should give same per-row result as features, plus
+    a small shape sanity check."""
+    from src.qwen_router import extract_hidden_state_batch
+    router_mod = sys.modules["src.qwen_router"]
+    # If the model isn't loaded, skip — but mark with a print.
+    from src.qwen_router import QwenCoordinator, QwenCoordinatorConfig
+    cfg = QwenCoordinatorConfig(
+        model_id="Qwen/Qwen3-0.6B-Base", head="linear", n_outputs=6,
+        device="cpu", use_argmax=False,
+    )
+    coord = QwenCoordinator(cfg=cfg, deterministic=True)
+    _ = coord.router.features("warm up")  # lazy load
+    ctxs = ["Q: 2+2?", "Q: 3*3?", "Q: capital of France?"]
+    feats = coord.router.features_batch(ctxs)
+    assert feats.shape == (3, coord.cfg.hidden_size), feats.shape
+    # Per-row match with single features()
+    for i, c in enumerate(ctxs):
+        single = coord.router.features(c)
+        assert np.allclose(feats[i], single, atol=1e-4), \
+            f"row {i} mismatch (max diff {np.max(np.abs(feats[i] - single))})"
+
+
+def test_batched_fitness_matches_naive():
+    """The batched fitness function should give exactly the same scores
+    as the naive per-candidate fitness function for a small test setup."""
+    from src.evolution import make_batched_qwen_fitness_fn, make_fitness_fn
+    from src.tasks import make_dataset
+    from src.llm_pool import LLMPool
+    from src.qwen_router import QwenCoordinator, QwenCoordinatorConfig
+
+    pool = LLMPool()
+    models = pool.keys
+    roles = ["Thinker", "Worker", "Verifier"]
+    n_outputs = len(models) * len(roles)
+
+    cfg = QwenCoordinatorConfig(
+        model_id="Qwen/Qwen3-0.6B-Base", head="linear", n_outputs=n_outputs,
+        device="cpu", use_argmax=False,
+    )
+    coord = QwenCoordinator(cfg=cfg, deterministic=True)
+    coord.configure_outputs(models, roles)
+    _ = coord.router.features("warm up")
+
+    rng = np.random.default_rng(0)
+    tasks = make_dataset(2, seed=42, difficulty_range=(1, 2))
+    fit_batched = make_batched_qwen_fitness_fn(
+        tasks, pool, max_turns=2, coord_template=coord, use_early_bonus=False,
+    )
+
+    def factory(p):
+        coord.set_params(p)
+        return coord
+    fit_naive = make_fitness_fn(
+        tasks, pool, max_turns=2, coord_factory=factory, use_early_bonus=False,
+    )
+
+    init = coord.get_params()
+    X = rng.standard_normal((4, init.size)).astype(np.float32) * 0.1
+    fits_b = fit_batched(X)
+    fits_n = np.array([fit_naive(x) for x in X])
+    assert np.allclose(fits_b, fits_n, atol=1e-6), \
+        f"batched vs naive mismatch: {fits_b} vs {fits_n}"
+
+
+def test_batched_fitness_shape():
+    """batched_fitness must return a 1-D array of length pop."""
+    from src.evolution import make_batched_qwen_fitness_fn
+    from src.tasks import make_dataset
+    from src.llm_pool import LLMPool
+    from src.qwen_router import QwenCoordinator, QwenCoordinatorConfig
+    pool = LLMPool()
+    models = pool.keys
+    roles = ["Thinker", "Worker", "Verifier"]
+    n_outputs = len(models) * len(roles)
+    cfg = QwenCoordinatorConfig(
+        model_id="Qwen/Qwen3-0.6B-Base", head="linear", n_outputs=n_outputs,
+        device="cpu", use_argmax=False,
+    )
+    coord = QwenCoordinator(cfg=cfg, deterministic=True)
+    coord.configure_outputs(models, roles)
+    _ = coord.router.features("warm up")
+    tasks = make_dataset(2, seed=0, difficulty_range=(1, 2))
+    fit = make_batched_qwen_fitness_fn(
+        tasks, pool, max_turns=2, coord_template=coord, use_early_bonus=False,
+    )
+    init = coord.get_params()
+    X = np.random.default_rng(0).standard_normal((6, init.size)).astype(np.float32) * 0.1
+    out = fit(X)
+    assert out.shape == (6,), out.shape
+    assert np.all(np.isfinite(out)), "non-finite fitness"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in dict(globals()).items() if k.startswith("test_") and callable(v)]
     fail = 0

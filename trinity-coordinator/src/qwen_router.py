@@ -81,6 +81,41 @@ def extract_hidden_state(model, tokenizer, text: str,
     return h.cpu().float().numpy()
 
 
+@torch.no_grad()
+def extract_hidden_state_batch(model, tokenizer, texts: list[str],
+                               layer_idx: int = -2,
+                               device: str = "cpu",
+                               max_length: int = 2048) -> np.ndarray:
+    """Batched version: extract last-token hidden state for many texts at once.
+
+    Shape: (len(texts), hidden_size) numpy array.
+
+    This is the critical speedup for sep-CMA-ES: instead of N separate
+    forward passes, do one batched forward. For transcripts of similar
+    length, this is ~N times faster on CPU and ~N times less memory
+    pressure (single KV cache, single embedding lookup, etc).
+    """
+    if not texts:
+        return np.zeros((0, model.config.hidden_size), dtype=np.float32)
+    enc = tokenizer(
+        texts,
+        return_tensors="pt",
+        padding=True,        # pad to longest in batch
+        truncation=True,
+        max_length=max_length,
+    )
+    if hasattr(enc, "to"):
+        enc = {k: v.to(device) for k, v in enc.items()}
+    out = model(**enc, output_hidden_states=True, use_cache=False)
+    h_all = out.hidden_states[layer_idx]            # (B, T, H)
+    # last *real* token (right-padded), found via attention_mask sum - 1
+    last_idx = enc["attention_mask"].sum(dim=1) - 1  # (B,)
+    last_idx = last_idx.clamp(min=0)
+    B = h_all.size(0)
+    h = h_all[torch.arange(B), last_idx, :]          # (B, H)
+    return h.cpu().float().numpy()
+
+
 @dataclass
 class QwenCoordinatorConfig:
     """Settings for QwenRouter (linear head over Qwen3 hidden state)."""
@@ -160,14 +195,53 @@ class QwenRouter(nn.Module):
         )
 
     def features_batch(self, contexts: list[str]) -> np.ndarray:
-        """Extract features for a batch of transcripts."""
-        return np.stack([self.features(c) for c in contexts], axis=0)
+        """Batched feature extraction: one Qwen3 forward over all contexts.
+
+        This is the key perf win — a batched forward is ~N times faster
+        than N separate forwards for similar-length contexts.
+        """
+        self._ensure_loaded()
+        if not contexts:
+            return np.zeros((0, self.cfg.hidden_size), dtype=np.float32)
+        # If we only have one context, the regular path is just as fast and
+        # avoids tokenizer overhead. But for >1 contexts, always batch.
+        if len(contexts) == 1:
+            return self.features(contexts[0])[None, :]
+        return extract_hidden_state_batch(
+            self._model, self._tokenizer, contexts,
+            layer_idx=self.cfg.layer_idx,
+            device=self.cfg.device,
+        )
 
     # ---- forward ----
     def forward(self, contexts: list[str]) -> torch.Tensor:
         """Return logits (1, n_outputs) for a single context."""
         h = torch.from_numpy(self.features(contexts[0])).unsqueeze(0)
         return self.head(h)
+
+    def forward_batched_features(self, features: np.ndarray) -> torch.Tensor:
+        """Batched head forward over pre-computed features.
+
+        Args:
+            features: (B, hidden_size) numpy array of pre-extracted Qwen
+                      features (use .features_batch() to get them).
+
+        Returns:
+            (B, n_outputs) logits tensor.
+        """
+        self._ensure_loaded()
+        h = torch.from_numpy(np.ascontiguousarray(features)).to(self.cfg.device)
+        return self.head(h)
+
+    def head_select(self, logits: torch.Tensor, deterministic: bool = True) -> list[int]:
+        """Convert a batched (B, n_outputs) logit tensor to per-sample actions.
+
+        deterministic=True -> argmax (paper's default; we want reproducibility)
+        """
+        if deterministic:
+            return torch.argmax(logits, dim=-1).tolist()
+        probs = torch.softmax(logits / max(1e-6, self.cfg.temperature), dim=-1)
+        return [int(torch.multinomial(p, 1).item()) for p in probs]
 
     # ---- action selection ----
     def select(self, context: str) -> int:

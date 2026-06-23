@@ -329,3 +329,184 @@ def train_router(pool: LLMPool, n_train: int = 16, n_eval: int = 32,
         print(f"Saved training log to {log_path}")
 
     return best, logs, coord_cfg
+
+
+# ------------------------------------------------------------------
+# Batched fitness for QwenCoordinator
+# ------------------------------------------------------------------
+#
+# The naive fitness() loops pop × task × turn Qwen3 forwards. The bulk
+# of wall-clock is the Qwen3 backbone, not the head. We can amortize:
+# for each (task, turn), the transcript only depends on the head params
+# via the action chosen at the PREVIOUS turn. So if we share transcripts
+# across candidates that picked the same previous action, we get
+# feature reuse.
+#
+# In practice, the simplest big win is **batching the Qwen3 forward over
+# all pop candidates at each (task, turn)**. Transcripts differ across
+# candidates (they took different actions), but they're usually within a
+# factor of 2 in length, and PyTorch's batched attention is far more
+# efficient than N separate forwards.
+#
+# This function evaluates a whole CMA-ES generation in one call.
+
+def make_batched_qwen_fitness_fn(
+    tasks: list,
+    pool,
+    max_turns: int = 6,
+    use_early_bonus: bool = True,
+    coord_template = None,  # QwenCoordinator instance (params will be overwritten)
+):
+    """Build a fitness function that evaluates a BATCH of head params at once.
+
+    coord_template: a QwenCoordinator whose backbone is loaded. We only
+    mutate its head parameters; backbone stays frozen. The caller must
+    pass a numpy array of shape (pop, d_params).
+    """
+    from .prompts import THINKER_PROMPT, WORKER_PROMPT, VERIFIER_PROMPT
+    from .tasks import extract_final_answer, is_correct
+    ROLE_PROMPTS = {"Thinker": THINKER_PROMPT, "Worker": WORKER_PROMPT,
+                    "Verifier": VERIFIER_PROMPT}
+
+    router = coord_template.router
+    # Match the deterministic behaviour of the naive path: use_argmax
+    # wins, else fall back to deterministic argmax, else sample.
+    deterministic = bool(getattr(coord_template.cfg, "use_argmax", False)
+                         or getattr(coord_template.cfg, "deterministic", True))
+    models = list(coord_template._models)
+    roles = list(coord_template._roles)
+
+    def _format_context(task, transcript, turn, max_turns):
+        """Mirror QwenCoordinator.route() so the cached features match."""
+        lines = []
+        if task is not None:
+            lines.append(f"Original Question: {task.prompt}")
+            lines.append("")
+        for m in transcript:
+            lines.append(f"{m['role']}: {m['content']}")
+        lines.append(f"\n[turn {turn}/{max_turns}] Choose next (model, role):")
+        return "\n".join(lines)
+
+    def _action_to_pair(action: int):
+        n_roles = len(roles)
+        return action // n_roles, roles[action % n_roles]
+
+    def batched_fitness(params_batch: np.ndarray) -> np.ndarray:
+        """Return a (pop,) array of fitness scores.
+
+        Simulates pop parallel rollouts of all tasks. For each (task, turn):
+          1. Build transcript-text for every (candidate, task) pair
+          2. features_batch() -> (pop*len(tasks), d_hidden)
+          3. For each candidate, apply its head params to its slice
+          4. Pick actions, run LLM pool, update transcripts
+        """
+        pop = params_batch.shape[0]
+        nt = len(tasks)
+        # Per-candidate state: a list (over tasks) of transcripts.
+        transcripts = [[
+            [{"role": "user", "content": f"Original Question: {t.prompt}"}]
+            for t in tasks
+        ] for _ in range(pop)]
+        # decisions[ci][ti] = list of (model_key, role) pairs for that rollout
+        decisions = [[[] for _ in range(nt)] for _ in range(pop)]
+        # done[ci][ti] = True once this rollout is finished (ACCEPT or max_turns)
+        done = [[False] * nt for _ in range(pop)]
+
+        for turn in range(1, max_turns + 1):
+            # Active (candidate, task) pairs
+            active_pairs = [(ci, ti) for ci in range(pop)
+                            for ti in range(nt) if not done[ci][ti]]
+            if not active_pairs:
+                break
+            # 1. Build context strings for all active pairs
+            ctxs = [_format_context(tasks[ti], transcripts[ci][ti], turn, max_turns)
+                    for ci, ti in active_pairs]
+            # 2. Batched Qwen3 forward
+            features = router.features_batch(ctxs)  # (active_pairs, H)
+            # 3. For each candidate, gather its slices of features (one per task)
+            #    then run head forward once per candidate.
+            offset = 0
+            # group features by candidate
+            per_cand_indices: dict[int, list[tuple[int, int]]] = {}
+            for k, (ci, ti) in enumerate(active_pairs):
+                per_cand_indices.setdefault(ci, []).append((k, ti))
+            for ci, items in per_cand_indices.items():
+                # set head params for this candidate
+                router.set_params(params_batch[ci])
+                idxs = [k for k, _ in items]
+                feat_ci = features[idxs]                            # (n_active_for_cand, H)
+                logits = router.forward_batched_features(feat_ci)  # (n_active_for_cand, n_actions)
+                actions = router.head_select(logits, deterministic=deterministic)
+                # 4. For each (candidate, task) pair, take the action
+                for (k, ti), action in zip(items, actions):
+                    t = tasks[ti]
+                    m_idx, role = _action_to_pair(action)
+                    model_key = models[m_idx]
+                    system = ROLE_PROMPTS[role]
+                    context = "\n".join(
+                        f"{m['role']}: {m['content']}" for m in transcripts[ci][ti]
+                    )
+                    output = pool.generate(model_key, system, context, role, task=t)
+                    tag = f"[{role} {model_key}]:"
+                    transcripts[ci][ti].append(
+                        {"role": "assistant", "content": f"{tag} {output}"}
+                    )
+                    decisions[ci][ti].append((model_key, role))
+                    if role == "Verifier" and "JUDGMENT: ACCEPT" in output:
+                        done[ci][ti] = True
+            # candidates that ran out of turns -> mark done
+            if turn == max_turns:
+                for ci, ti in active_pairs:
+                    done[ci][ti] = True
+
+        # Score each candidate: mean per-task fitness
+        per_cand_task_scores = np.zeros((pop, nt), dtype=np.float64)
+        for ci in range(pop):
+            for ti, t in enumerate(tasks):
+                # find last Worker's final answer in this transcript
+                last_final = None
+                for m in transcripts[ci][ti]:
+                    if m["role"] == "assistant" and "Worker" in m["content"]:
+                        last_final = extract_final_answer(m["content"])
+                correct = is_correct(t, last_final or "")
+                base = 1.0 if correct else 0.0
+                if use_early_bonus and correct:
+                    turn_eff = (max_turns - len(decisions[ci][ti])) / max(1, max_turns)
+                    base += 0.3 * turn_eff
+                    used_verifier = any(r == "Verifier" for _, r in decisions[ci][ti])
+                    if used_verifier:
+                        base += 0.1
+                per_cand_task_scores[ci, ti] = base
+        return per_cand_task_scores.mean(axis=1)
+
+    return batched_fitness
+
+
+def make_batched_qwen_es_cfg(
+    tasks: list,
+    pool,
+    coord_template,  # QwenCoordinator (backbone loaded, head dummy)
+    pop_size: int = 31,
+    generations: int = 15,
+    max_turns: int = 4,
+    sigma_init: float = 0.15,
+):
+    """Build a CMAESConfig whose fitness_fn evaluates the WHOLE generation
+    in one batched call.
+
+    Returns (cfg, init_params) where init_params is the head's param vector
+    (used as the CMA-ES mean).
+    """
+    init_params = coord_template.get_params()
+    d = init_params.size
+    fit_fn = make_batched_qwen_fitness_fn(
+        tasks, pool, max_turns=max_turns, coord_template=coord_template,
+    )
+    cfg = CMAESConfig(
+        n_dim=d,
+        pop_size=pop_size,
+        sigma_init=sigma_init,
+        generations=generations,
+        fitness_fn=fit_fn,
+    )
+    return cfg, init_params
