@@ -5,6 +5,39 @@ A standalone Python prototype of **TRINITY: An Evolved LLM Coordinator**
 focused on Section 3 (state machine + head architectures) and Section 4.8
 (sep-CMA-ES vs random search).
 
+## Quickstart
+
+> **TL;DR — go from a fresh clone to a working reproduction in ~5 min.**
+
+```bash
+# 1. Get the code & activate the venv
+git clone <this-repo> llm-coordinator
+cd llm-coordinator
+source ~/venvs/headroom/bin/activate          # or create it (see Setup below)
+
+# 2. (One-time) install + download the Qwen backbone
+pip install -r requirements.txt
+huggingface-cli download Qwen/Qwen3-0.6B-Base
+
+# 3. Run the tests — you should see 19/19 PASS
+python tests/test_smoke.py
+
+# 4. Reproduce the paper's main result (~1 min)
+python examples/reproduce_s4_8.py
+#   sep-CMA-ES  acc=99.17% ± 1.18%
+#   RS          acc=94.17% ± 2.36%
+#   → sep-CMA-ES wins by 5pp, matching Table 4
+
+# 5. Train a Qwen3-0.6B-backed head with sep-CMA-ES (~5–25 min on MPS+fp16)
+python examples/ablate_qwen_heads.py \
+    --gens 6 --train 8 --eval 16 \
+    --heads linear block_diag low_rank sparse mlp \
+    --device mps --dtype float16 \
+    --save artifacts/qwen_head_ablation_mps.json
+```
+
+If `python examples/reproduce_s4_8.py` doesn't print numbers, jump to **Setup** below.
+
 ## What's in the box
 
 | Module | What it does |
