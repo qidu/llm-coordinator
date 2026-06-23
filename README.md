@@ -34,10 +34,39 @@ their most parameter-efficient choice).
 
 Paper Table 6 (real setup: $d_h=1024$, $n_a=10$): linear=10,240 / sparse=11,266 / block-diag-2=5,120 / block-diag-10=**1,024**.
 
+## Setup
+
+The project uses a Python 3.12 venv called `headroom` (lives at `~/venvs/headroom`). It already has PyTorch, Transformers, NumPy, and pytest installed — no `pip install` needed unless you're starting from scratch.
+
+```bash
+# Activate the venv (do this once per shell)
+source ~/venvs/headroom/bin/activate
+
+# If the venv doesn't exist yet, create it:
+python3.12 -m venv ~/venvs/headroom
+source ~/venvs/headroom/bin/activate
+pip install -r requirements.txt
+
+# Verify the install
+python -c "import torch, transformers, numpy; print(torch.__version__, transformers.__version__)"
+```
+
+For the Qwen3-0.6B backbone used in `run_qwen.py` / `train_qwen.py` / `ablate_qwen_heads.py`, you also need the model weights. The repo expects them in the standard HuggingFace cache:
+
+```bash
+# Download Qwen3-0.6B-Base (~1.2GB). If this gets stuck partway, see
+# scripts/finish_qwen_download.sh which resumes from where it stopped.
+huggingface-cli download Qwen/Qwen3-0.6B-Base
+# or, if huggingface.co is blocked in your region:
+HF_ENDPOINT=https://hf-mirror.com huggingface-cli download Qwen/Qwen3-0.6B-Base
+```
+
+The first time `QwenRouter` is constructed it will load these weights into the cache at `~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B-Base/` (~1.2 GB).
+
 ## How to run
 
 ```bash
-# smoke tests (13/13)
+# smoke tests (19/19)
 python tests/test_smoke.py
 
 # heuristic baseline
@@ -53,9 +82,10 @@ python examples/train_router.py --head block_diag --no-argmax --gens 15
 # S4.8 reproduction: sep-CMA-ES vs Random Search (multi-seed average)
 python examples/reproduce_s4_8.py --gens 20 --train 24 --n-seeds 3
 
-# Qwen2-0.5B backbone (optional, needs transformers)
-pip install transformers
-python examples/run_qwen.py
+# Qwen3-0.6B backbone (paper-faithful; needs the Qwen3-0.6B-Base download above)
+python examples/run_qwen.py                    # single forward pass
+python examples/train_qwen.py                  # train one head via sep-CMA-ES
+python examples/ablate_qwen_heads.py --help    # full 5-head ablation
 ```
 
 ### Sample run — head-architecture ablation (default settings)
@@ -145,7 +175,7 @@ llm-coordinator/
 │   ├── evolution.py              # sep-CMA-ES + RS baseline
 │   └── eval.py                   # comparison harness
 ├── tests/
-│   └── test_smoke.py             # 13 tests
+│   └── test_smoke.py             # 19 tests
 ├── examples/
 │   ├── run_heuristic.py
 │   ├── train_router.py
