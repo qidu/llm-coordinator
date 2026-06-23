@@ -12,7 +12,7 @@ focused on Section 3 (state machine + head architectures) and Section 4.8
 ```bash
 # 1. Get the code & activate the venv
 git clone <this-repo> llm-coordinator
-cd llm-coordinator
+cd llm-coordinator                            # the repo IS llm-coordinator
 source ~/venvs/headroom/bin/activate          # or create it (see Setup below)
 
 # 2. (One-time) install + download the Qwen backbone
@@ -193,7 +193,7 @@ learns to stop as soon as it has a good answer.
 ## File map
 
 ```
-llm-coordinator/
+.                            # repo root (= llm-coordinator/ on disk)
 ├── README.md
 ├── requirements.txt
 ├── notes/paper_summary.md       # paper notes (verified against arXiv:2512.04695v3)
@@ -220,3 +220,7 @@ llm-coordinator/
 └── notes/
     └── paper_summary.md
 ```
+
+(Historical note: the repo root used to be `/Users/chris/workspace/openclaw/`
+with `llm-coordinator/` as a subdirectory. It's been moved — `llm-coordinator/`
+is now the project root on disk and on GitHub.)
