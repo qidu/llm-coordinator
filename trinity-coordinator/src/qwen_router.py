@@ -250,6 +250,26 @@ class QwenCoordinator:
         role = self._roles[action % n_roles]
         return model_idx, role
 
+    def route(self, turn: int, transcript: list[dict], task=None,
+              max_turns: int = 6) -> tuple[str, str]:
+        """TrinitySystem-compatible interface. Formats transcript as a
+        context string and delegates to act()."""
+        if self._models is None or self._roles is None:
+            raise RuntimeError("call configure_outputs(pool.models, roles) first")
+        # Build a paper-style context: include the original question + prior
+        # assistant turns (tagged). Same convention as TrinitySystem.solve.
+        lines = []
+        if task is not None:
+            lines.append(f"Original Question: {task.prompt}")
+            lines.append("")
+        for m in transcript:
+            lines.append(f"{m['role']}: {m['content']}")
+        # Hint the current turn so the router knows it's its turn to act
+        lines.append(f"\n[turn {turn}/{max_turns}] Choose next (model, role):")
+        context = "\n".join(lines)
+        model_idx, role = self.act(context)
+        return self._models[model_idx], role
+
     # ---- convenience for sep-CMA-ES fitness ----
     def get_params(self) -> np.ndarray:
         return self.router.get_params()
@@ -259,3 +279,9 @@ class QwenCoordinator:
 
     def num_parameters(self) -> int:
         return self.router.num_parameters()
+
+    def reset(self):
+        # QwenCoordinator is stateless across episodes — the backbone is
+        # frozen and shared across all CMA-ES candidates, and per-task
+        # history is owned by TrinitySystem. Match MLPCoordinator's no-op.
+        pass

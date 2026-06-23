@@ -267,6 +267,17 @@ def test_qwen_router_with_fake_backbone():
             coord2.configure_outputs(pool.keys, ["Thinker", "Worker", "Verifier"])
             _ = coord2.router.features("warm up")
             assert coord2.num_parameters() > 0
+        # reset() exists and is a no-op (TrinitySystem calls it per episode)
+        coord.reset()
+        # route(turn, transcript, task, max_turns) returns (model_key, role)
+        # — TrinitySystem calls this contract.
+        m_key, role = coord.route(
+            1,
+            [{"role": "user", "content": "Q: 2+2?"}],
+            task=None, max_turns=4,
+        )
+        assert m_key in pool.keys
+        assert role in ("Thinker", "Worker", "Verifier")
     finally:
         qr.load_qwen3 = original
 
