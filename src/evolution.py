@@ -41,6 +41,9 @@ class CMAESConfig:
     tau_c: float = 0.0          # set below
     generations: int = 30
     fitness_fn: Callable[[np.ndarray], float] = None  # type: ignore
+    batched_fitness_fn: Callable[[np.ndarray], np.ndarray] = None  # type: ignore
+    # If set, takes (pop, d) and returns (pop,) fitness. Takes precedence
+    # over per-candidate fitness_fn. Used by the Qwen batched path.
 
     def __post_init__(self):
         # Standard sep-CMA-ES schedule
@@ -82,7 +85,10 @@ def random_search(cfg: CMAESConfig, init_params: np.ndarray,
         # RS samples from a fixed prior around the initial mean
         Z = rng.standard_normal((pop, d))
         X = mean + cfg.sigma_init * Z
-        fits = np.array([cfg.fitness_fn(x.astype(np.float32)) for x in X], dtype=np.float64)
+        if cfg.batched_fitness_fn is not None:
+            fits = np.asarray(cfg.batched_fitness_fn(X.astype(np.float32)), dtype=np.float64)
+        else:
+            fits = np.array([cfg.fitness_fn(x.astype(np.float32)) for x in X], dtype=np.float64)
         order = np.argsort(-fits)
         if fits[order[0]] > best_so_far:
             best_so_far = fits[order[0]]
@@ -150,7 +156,10 @@ def sep_cma_es(cfg: CMAESConfig, init_params: np.ndarray,
         Z = rng.standard_normal((lam, d))
         X = mean + sigma * Z
         # ---- evaluate ----
-        fits = np.array([cfg.fitness_fn(x.astype(np.float32)) for x in X], dtype=np.float64)
+        if cfg.batched_fitness_fn is not None:
+            fits = np.asarray(cfg.batched_fitness_fn(X.astype(np.float32)), dtype=np.float64)
+        else:
+            fits = np.array([cfg.fitness_fn(x.astype(np.float32)) for x in X], dtype=np.float64)
         order = np.argsort(-fits)  # descending
         X_sel = X[order[:mu]]
         fits_sel = fits[order[:mu]]
@@ -400,6 +409,10 @@ def make_batched_qwen_fitness_fn(
           3. For each candidate, apply its head params to its slice
           4. Pick actions, run LLM pool, update transcripts
         """
+        # sep_cma_es sometimes calls fitness with a single 1-D vector; we
+        # always work in 2-D (pop, d).
+        if params_batch.ndim == 1:
+            params_batch = params_batch[None, :]
         pop = params_batch.shape[0]
         nt = len(tasks)
         # Per-candidate state: a list (over tasks) of transcripts.
@@ -507,6 +520,6 @@ def make_batched_qwen_es_cfg(
         pop_size=pop_size,
         sigma_init=sigma_init,
         generations=generations,
-        fitness_fn=fit_fn,
+        batched_fitness_fn=fit_fn,
     )
     return cfg, init_params

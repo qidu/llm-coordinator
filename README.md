@@ -130,7 +130,7 @@ learns to stop as soon as it has a good answer.
 ## File map
 
 ```
-trinity-coordinator/
+llm-coordinator/
 ├── README.md
 ├── requirements.txt
 ├── notes/paper_summary.md       # paper notes (verified against arXiv:2512.04695v3)

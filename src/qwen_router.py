@@ -174,6 +174,13 @@ class QwenRouter(nn.Module):
             n_blocks=self.cfg.n_outputs,
         )
         self._head = make_head(head_cfg)
+        # Move head to the same device/dtype as the backbone so the
+        # forward doesn't bounce tensors between CPU and GPU. For
+        # heads <100K params this is free.
+        if self.cfg.device != "cpu":
+            self._head = self._head.to(self.cfg.device)
+        if self.cfg.dtype != torch.float32:
+            self._head = self._head.to(self.cfg.dtype)
 
     @property
     def head(self) -> nn.Module:
@@ -217,6 +224,9 @@ class QwenRouter(nn.Module):
     def forward(self, contexts: list[str]) -> torch.Tensor:
         """Return logits (1, n_outputs) for a single context."""
         h = torch.from_numpy(self.features(contexts[0])).unsqueeze(0)
+        # Match the head's device + dtype so the matmul agrees.
+        head_params = next(self.head.parameters())
+        h = h.to(device=head_params.device, dtype=head_params.dtype)
         return self.head(h)
 
     def forward_batched_features(self, features: np.ndarray) -> torch.Tensor:
@@ -230,7 +240,10 @@ class QwenRouter(nn.Module):
             (B, n_outputs) logits tensor.
         """
         self._ensure_loaded()
-        h = torch.from_numpy(np.ascontiguousarray(features)).to(self.cfg.device)
+        h = torch.from_numpy(np.ascontiguousarray(features))
+        # Match the head's device + dtype so the matmul agrees.
+        h = h.to(device=next(self.head.parameters()).device,
+                 dtype=next(self.head.parameters()).dtype)
         return self.head(h)
 
     def head_select(self, logits: torch.Tensor, deterministic: bool = True) -> list[int]:
@@ -261,7 +274,7 @@ class QwenRouter(nn.Module):
     def get_params(self) -> np.ndarray:
         self._ensure_loaded()
         return np.concatenate([
-            p.detach().cpu().numpy().flatten()
+            p.detach().cpu().float().numpy().flatten()
             for p in self.head.parameters()
         ])
 
@@ -270,8 +283,9 @@ class QwenRouter(nn.Module):
         idx = 0
         for p in self.head.parameters():
             n = p.numel()
-            new = flat[idx:idx + n].reshape(p.shape).astype(np.float32)
-            p.data = torch.from_numpy(new).to(p.device)
+            new = flat[idx:idx + n].reshape(p.shape)
+            t = torch.from_numpy(new).to(p.device).to(p.dtype)
+            p.data = t
             idx += n
         assert idx == flat.size, f"param size mismatch: {idx} vs {flat.size}"
 

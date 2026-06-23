@@ -1,0 +1,26 @@
+{
+  "results": {
+    "linear": {
+      "acc": 0.9375,
+      "accept": 0.0,
+      "avg_turns": 4.0,
+      "train_time_s": 698.4304099082947,
+      "d": 6144,
+      "pop": 31
+    },
+    "block_diag": {
+      "acc": 0.9375,
+      "accept": 0.0,
+      "avg_turns": 4.0,
+      "train_time_s": 865.5385699272156,
+      "d": 1024,
+      "pop": 25
+    }
+  },
+  "best": "linear",
+  "gens": 6,
+  "train": 8,
+  "eval": 16,
+  "method": "cma",
+  "model": "Qwen/Qwen3-0.6B-Base"
+}

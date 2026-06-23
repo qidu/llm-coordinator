@@ -383,6 +383,24 @@ def test_batched_fitness_shape():
     assert np.all(np.isfinite(out)), "non-finite fitness"
 
 
+def test_set_params_dtype_preservation():
+    """set_params should respect the head's existing dtype (e.g. bfloat16)."""
+    from src.qwen_router import QwenCoordinator, QwenCoordinatorConfig
+    import torch
+    cfg = QwenCoordinatorConfig(
+        model_id="Qwen/Qwen3-0.6B-Base", head="linear", n_outputs=6,
+        device="cpu", use_argmax=False, dtype=torch.bfloat16,
+    )
+    coord = QwenCoordinator(cfg=cfg, deterministic=True)
+    # Lazy init
+    _ = coord.router.features("warm up")
+    init = coord.get_params()  # should always return float32 (CMA-ES uses fp32)
+    # Now set back — head weights should still be bf16
+    coord.set_params(init)
+    for p in coord.router.head.parameters():
+        assert p.dtype == torch.bfloat16, f"head param dtype = {p.dtype}, expected bf16"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in dict(globals()).items() if k.startswith("test_") and callable(v)]
     fail = 0
