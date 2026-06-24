@@ -76,12 +76,13 @@ If `python examples/reproduce_s4_8.py` doesn't print numbers, jump to **Setup** 
 | Module | What it does |
 |---|---|
 | `src/tasks.py` | Toy tasks (arithmetic / logic / string / two-step) with verifiable answers |
-| `src/llm_pool.py` | `MockSmallLLM` (80% reliable) and `MockStrongLLM` (98% reliable) — drop-in interface for real LLMs |
+| `src/llm_pool.py` | `MockSmallLLM` (80% reliable) and `MockStrongLLM` (98% reliable) — `LLM` Protocol interface for plugging in real LLMs |
 | `src/features.py` | 16-dim transcript feature vector (turn #, last role, reject count, etc.) |
 | `src/heads.py` | **4 paper-faithful head architectures** (Appendix A.4): Linear, Low-rank, Sparse, **Block-diagonal** + a generic MLP |
 | `src/coordinator.py` | `HeuristicCoordinator`, `MLPCoordinator` (any head), `QwenCoordinator` (optional) |
+| `src/qwen_router.py` | `QwenRouter` — frozen Qwen3-0.6B backbone + trainable head (all 4 paper architectures); batched fitness for sep-CMA-ES speedup |
 | `src/trinity_system.py` | The Section 3.2 state machine: per turn, coordinator picks `(model, role)`, the LLM answers, verifier may terminate |
-| `src/evolution.py` | **sep-CMA-ES** (pure NumPy, ~150 LOC) + **Random Search baseline** (paper S4.8) |
+| `src/evolution.py` | **sep-CMA-ES** (pure NumPy, ~150 LOC) + **Random Search baseline** (paper S4.8) — `recommended_pop_size` implements the paper's $\lceil 4 + 3\ln n \rceil$ formula |
 | `src/eval.py` | Compare two coordinators on a task batch |
 
 ## Head architectures (Appendix A.4)
@@ -175,14 +176,14 @@ strong model is reliable enough that planning is unnecessary on this task mix.
 
 ## Architecture notes
 
-### Why engineered features instead of Qwen hidden state?
+### Two feature paths: engineered vs. Qwen hidden state
 
-The paper uses Qwen3-0.6B as a feature extractor (last-token hidden state)
-because their 16GB benchmarks need rich representations. For a prototype,
-a hand-crafted 16-dim feature vector (turn #, last role, reject count, etc.)
-captures the routing signal cheaply. The MLPCoordinator is the same
-whether features come from an LLM or engineered code — `QwenCoordinator`
-is the drop-in upgrade.
+The repo ships with two interchangeable feature paths, flipped from the README's original framing:
+
+- **MLPCoordinator** (default): hand-crafted 16-dim feature vector (turn #, last role, reject count, etc.). Fast, no GPU needed. Useful for rapid prototyping of head architectures and evolution hyperparameters.
+- **QwenCoordinator** (`src/qwen_router.py`): frozen Qwen3-0.6B backbone (last-token hidden state, same as the paper). Drop-in replacement — same `route()` interface. Powers `train_qwen.py` and `ablate_qwen_heads.py`.
+
+Both coordinators share the same `TrinitySystem` and evolution loop. The toy regime defaults to MLPCoordinator for speed; swap to QwenCoordinator when you want paper-faithful features.
 
 ### Why sep-CMA-ES instead of RL?
 
@@ -209,19 +210,22 @@ learns to stop as soon as it has a good answer.
 
 ## Honest gaps to the paper
 
-| Aspect | Paper | This repo |
-|---|---|---|
-| SLM backbone | Qwen3-0.6B + SVF (9,216 trainable params) | 16-dim engineered features |
-| Head | 4 architectures + argmax/softmax | All 4 implemented + argmax; also MLP for toy regime |
-| Model pool | 7 real LLMs (GPT-5, Gemini-2.5-Pro, Claude-4, Gemma-3-27B, DeepSeek-R1-Distill-32B, Qwen3-32B x2) | 2 mocks (small, strong) |
-| $n_a$ | 10 (7 models + 3 roles) | 5 (2 models + 3 roles) |
-| Max turns K | 5 | 5 (configurable) |
-| Population size | $\lceil 4 + 3 \ln n \rceil$ (32 for n=10K) | Auto-computed via `recommended_pop_size` |
-| Real benchmarks | MATH500, MMLU, RLPR, LiveCodeBench | Toy suite (arithmetic, logic, string) |
-| sep-CMA-ES | ✅ | ✅ |
-| Random Search baseline (S4.8) | ✅ (Table 4) | ✅ (implemented, reproduced) |
-| REINFORCE baseline | ✅ | ❌ (could add as future) |
-| SFT baseline | ✅ | ❌ (could add as future) |
+| Aspect | Paper | This repo | Status |
+|---|---|---|---|
+| SLM backbone | Qwen3-0.6B + SVF (9,216 trainable params) | `QwenRouter` (frozen Qwen3-0.6B + trainable head) via `examples/train_qwen.py` / `ablate_qwen_heads.py` | ✅ |
+| Head | 4 architectures + argmax/softmax | All 4 implemented + argmax; also MLP for toy regime | ✅ |
+| Population size | $\lceil 4 + 3 \ln n \rceil$ (32 for n=10K) | `recommended_pop_size` in `src/evolution.py:264` — exact formula | ✅ |
+| Model pool | 7 real LLMs (GPT-5, Gemini-2.5-Pro, Claude-4, Gemma-3-27B, DeepSeek-R1-Distill-32B, Qwen3-32B x2) | 2 mocks (small, strong) — `LLM` Protocol in `src/llm_pool.py` ready for real LLMs; hardcoded 2-model assumptions in `features.py` / `coordinator.py` need updating | 🔧 |
+| $n_a$ | 10 (7 models + 3 roles) | 5 (2 models + 3 roles) | 🔧 |
+| Real benchmarks | MATH500, MMLU, RLPR, LiveCodeBench | Toy suite (arithmetic, logic, string) — `Task` abstraction in `src/tasks.py` is benchmark-agnostic; needs dataset loaders | 🔧 |
+| sep-CMA-ES | ✅ | ✅ | — |
+| Random Search baseline (S4.8) | ✅ (Table 4) | ✅ (implemented, reproduced) | — |
+| REINFORCE baseline | ✅ | ❌ (could add as future) | — |
+| SFT baseline | ✅ | ❌ (could add as future) | — |
+
+**Legend:** ✅ = matches paper, 🔧 = fixable with moderate effort, ❌ = not implemented
+
+The three 🔧 gaps are all structurally feasible: the abstractions are in place (Protocol interface for real LLMs, `Task` objects for benchmarks, configurable `n_outputs` for action space). The remaining work is data loading and removing the 2-model hardcodes.
 
 ## File map
 
@@ -236,7 +240,8 @@ learns to stop as soon as it has a good answer.
 │   ├── llm_pool.py               # mock LLMs
 │   ├── features.py               # 16-dim transcript features
 │   ├── heads.py                  # 4 paper head architectures + MLP
-│   ├── coordinator.py            # heuristic / MLP / Qwen coordinators
+│   ├── coordinator.py            # heuristic / MLP coordinators
+│   ├── qwen_router.py           # Qwen3-0.6B backbone + trainable head
 │   ├── trinity_system.py         # Section 3.2 state machine
 │   ├── evolution.py              # sep-CMA-ES + RS baseline
 │   └── eval.py                   # comparison harness
@@ -246,14 +251,12 @@ learns to stop as soon as it has a good answer.
 │   ├── run_heuristic.py
 │   ├── train_router.py
 │   ├── reproduce_s4_8.py         # sep-CMA-ES vs RS, multi-seed
-│   ├── run_qwen.py
+│   ├── run_qwen.py              # single forward pass with Qwen3-0.6B
+│   ├── train_qwen.py            # train head via sep-CMA-ES
+│   ├── ablate_qwen_heads.py     # 5-head ablation
 │   └── plot_curve.py
 ├── data/                         # (for future: real task suites)
 ├── artifacts/                    # trained params, logs
 └── notes/
     └── paper_summary.md
 ```
-
-(Historical note: the repo root used to be `/Users/chris/workspace/openclaw/`
-with `llm-coordinator/` as a subdirectory. It's been moved — `llm-coordinator/`
-is now the project root on disk and on GitHub.)
