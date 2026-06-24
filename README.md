@@ -55,6 +55,20 @@ Head               d  pop     acc  accept   turns    time
 Best head: linear (100.0% acc)
 ```
 
+> **Why `linear` wins at 0.6B scale — and what this result means**
+>
+> The `linear` head wins not because it's architecturally superior, but because at 0.6B scale the routing signal is too weak to benefit from expert specialization. MoE's promise is that the router learns to send different inputs (math, code, dialogue, etc.) to different experts, each becoming a specialist. At 0.6B there isn't enough model capacity or training signal for true specialization — what you'd expect to be "Expert A for math, Expert B for code" collapses into barely-different copies of the same thing.
+>
+> The constrained variants (`block_diag`, `sparse`, `mlp`) are actively harmful at this scale because they add a routing bottleneck on top of an already-weak routing signal. The `block_diag` result is the clearest signal: **0% acceptance** means the router almost never picked the expert it trained on, confirming the routing signal itself hasn't formed meaningful expert niches.
+>
+> This result is a **false negative for expert-constrained architectures**, not a positive endorsement of linear heads. If you want to measure true expert quality at scale, look at:
+>
+> - Does the router show consistent per-example routing patterns?
+> - Do different experts show measurably different activation norms?
+> - What does routing entropy look like across the eval set?
+>
+> Running this ablation on a larger model (e.g. Qwen3-32B) would likely flip the story — the routing signal has enough capacity to carve out specialist pathways, and constrained heads become a feature rather than a bug.
+
 If `python examples/reproduce_s4_8.py` doesn't print numbers, jump to **Setup** below.
 
 ## What's in the box
