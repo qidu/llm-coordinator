@@ -365,12 +365,17 @@ def make_batched_qwen_fitness_fn(
     max_turns: int = 6,
     use_early_bonus: bool = True,
     coord_template = None,  # QwenCoordinator instance (params will be overwritten)
+    batch_size: int = 0,    # chunk size for Qwen3 forwards (0 = no chunking)
 ):
     """Build a fitness function that evaluates a BATCH of head params at once.
 
     coord_template: a QwenCoordinator whose backbone is loaded. We only
     mutate its head parameters; backbone stays frozen. The caller must
     pass a numpy array of shape (pop, d_params).
+
+    batch_size: if > 0, splits Qwen3 forward passes into chunks of this
+    many contexts to avoid GPU OOM. Tune downward (e.g. 4-16) for
+    smaller GPUs.
     """
     from .prompts import THINKER_PROMPT, WORKER_PROMPT, VERIFIER_PROMPT
     from .tasks import extract_final_answer, is_correct
@@ -435,7 +440,7 @@ def make_batched_qwen_fitness_fn(
             ctxs = [_format_context(tasks[ti], transcripts[ci][ti], turn, max_turns)
                     for ci, ti in active_pairs]
             # 2. Batched Qwen3 forward
-            features = router.features_batch(ctxs)  # (active_pairs, H)
+            features = router.features_batch(ctxs, batch_size=batch_size)  # (active_pairs, H)
             # 3. For each candidate, gather its slices of features (one per task)
             #    then run head forward once per candidate.
             offset = 0

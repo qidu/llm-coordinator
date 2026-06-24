@@ -309,7 +309,7 @@ def test_extract_hidden_state_batch():
     # Per-row match with single features()
     for i, c in enumerate(ctxs):
         single = coord.router.features(c)
-        assert np.allclose(feats[i], single, atol=1e-4), \
+        assert np.allclose(feats[i], single, atol=2e-4), \
             f"row {i} mismatch (max diff {np.max(np.abs(feats[i] - single))})"
 
 

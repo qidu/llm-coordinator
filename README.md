@@ -28,12 +28,31 @@ python examples/reproduce_s4_8.py
 #   RS          acc=94.17% ± 2.36%
 #   → sep-CMA-ES wins by 5pp, matching Table 4
 
-# 5. Train a Qwen3-0.6B-backed head with sep-CMA-ES (~5–25 min on MPS+fp16)
+# 5. Train a Qwen3-0.6B-backed head with sep-CMA-ES (~5–25 min on MPS+fp16 or CUDA+fp16)
+## macOS
 python examples/ablate_qwen_heads.py \
     --gens 6 --train 8 --eval 16 \
     --heads linear block_diag low_rank sparse mlp \
     --device mps --dtype float16 \
     --save artifacts/qwen_head_ablation_mps.json
+## Linux with cuda
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python examples/ablate_qwen_heads.py \
+    --device cuda --dtype float16 --train 8 --eval 8 --gens 6 \
+    --heads linear block_diag low_rank sparse mlp --no-batched \
+    --save artifacts/qwen_head_ablation_cuda.json
+```
+```bash
+============================================================
+Qwen3-0.6B Head-Architecture Ablation  (gens=6, train=8, eval=8, method=cma)
+============================================================
+Head               d  pop     acc  accept   turns    time
+  linear        6144   31  100.0%  100.0%    2.25  137.7s
+  block_diag    1024   25  87.5%   0.0%    4.00  105.0s
+  low_rank     32960   36  87.5%  100.0%    2.62  164.0s
+  sparse        7169   31  87.5%  75.0%    2.62  100.6s
+  mlp          34054   36  87.5%  37.5%    3.25  147.3s
+
+Best head: linear (100.0% acc)
 ```
 
 If `python examples/reproduce_s4_8.py` doesn't print numbers, jump to **Setup** below.

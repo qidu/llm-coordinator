@@ -1,0 +1,50 @@
+{
+  "results": {
+    "linear": {
+      "acc": 1.0,
+      "accept": 1.0,
+      "avg_turns": 2.25,
+      "train_time_s": 137.73724746704102,
+      "d": 6144,
+      "pop": 31
+    },
+    "block_diag": {
+      "acc": 0.875,
+      "accept": 0.0,
+      "avg_turns": 4.0,
+      "train_time_s": 104.95368242263794,
+      "d": 1024,
+      "pop": 25
+    },
+    "low_rank": {
+      "acc": 0.875,
+      "accept": 1.0,
+      "avg_turns": 2.625,
+      "train_time_s": 163.99053478240967,
+      "d": 32960,
+      "pop": 36
+    },
+    "sparse": {
+      "acc": 0.875,
+      "accept": 0.75,
+      "avg_turns": 2.625,
+      "train_time_s": 100.5778648853302,
+      "d": 7169,
+      "pop": 31
+    },
+    "mlp": {
+      "acc": 0.875,
+      "accept": 0.375,
+      "avg_turns": 3.25,
+      "train_time_s": 147.25597429275513,
+      "d": 34054,
+      "pop": 36
+    }
+  },
+  "best": "linear",
+  "gens": 6,
+  "train": 8,
+  "eval": 8,
+  "method": "cma",
+  "model": "Qwen/Qwen3-0.6B-Base"
+}

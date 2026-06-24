@@ -42,9 +42,9 @@ def main():
     ap.add_argument("--no-batched", action="store_true",
                     help="Disable the batched fitness path (slower but "
                          "byte-for-byte identical to the naive per-candidate loop).")
-    ap.add_argument("--device", default="cpu", choices=["cpu", "mps"],
+    ap.add_argument("--device", default="cpu", choices=["cpu", "mps", "cuda"],
                     help="Compute device for the Qwen backbone. "
-                         "mps uses Apple Silicon GPU (~3x faster per batched element).")
+                         "cuda for NVIDIA GPUs, mps for Apple Silicon.")
     ap.add_argument("--dtype", default="float32", choices=["float32", "float16", "bfloat16"],
                     help="Model precision. float16/bfloat16 halves memory + speeds up MPS.")
     ap.add_argument("--seed", type=int, default=0)

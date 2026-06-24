@@ -44,7 +44,7 @@ def load_qwen3(model_id: str = "Qwen/Qwen3-0.6B-Base",
     # load in fp32 so the extracted hidden states are stable on CPU
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        torch_dtype=dtype,
+        dtype=dtype,
         attn_implementation=attn_impl,
         output_hidden_states=True,
     )
@@ -73,7 +73,7 @@ def extract_hidden_state(model, tokenizer, text: str,
                        max_length=max_length)
     if hasattr(inputs, "to"):
         inputs = inputs.to(device)
-    out = model(**inputs, output_hidden_states=True, use_cache=False)
+    out = model(**inputs, use_cache=False)
     # out.hidden_states is a tuple of (num_layers + 1) tensors, each (1, T, hidden)
     # layer 0 = embedding output; layer i = output of layer i
     # layer_idx = -2 -> second-to-last
@@ -85,7 +85,8 @@ def extract_hidden_state(model, tokenizer, text: str,
 def extract_hidden_state_batch(model, tokenizer, texts: list[str],
                                layer_idx: int = -2,
                                device: str = "cpu",
-                               max_length: int = 2048) -> np.ndarray:
+                               max_length: int = 2048,
+                               batch_size: int = 0) -> np.ndarray:
     """Batched version: extract last-token hidden state for many texts at once.
 
     Shape: (len(texts), hidden_size) numpy array.
@@ -94,9 +95,23 @@ def extract_hidden_state_batch(model, tokenizer, texts: list[str],
     forward passes, do one batched forward. For transcripts of similar
     length, this is ~N times faster on CPU and ~N times less memory
     pressure (single KV cache, single embedding lookup, etc).
+
+    When batch_size > 0, splits the input into chunks to avoid OOM on
+    GPUs with limited VRAM. Each chunk is padded independently so the
+    padding overhead doesn't cascade across the full set.
     """
     if not texts:
         return np.zeros((0, model.config.hidden_size), dtype=np.float32)
+    if batch_size > 0 and len(texts) > batch_size:
+        chunks = []
+        for i in range(0, len(texts), batch_size):
+            chunk = extract_hidden_state_batch(
+                model, tokenizer, texts[i:i + batch_size],
+                layer_idx=layer_idx, device=device, max_length=max_length,
+                batch_size=0,  # inner calls don't recurse
+            )
+            chunks.append(chunk)
+        return np.concatenate(chunks, axis=0)
     enc = tokenizer(
         texts,
         return_tensors="pt",
@@ -106,7 +121,7 @@ def extract_hidden_state_batch(model, tokenizer, texts: list[str],
     )
     if hasattr(enc, "to"):
         enc = {k: v.to(device) for k, v in enc.items()}
-    out = model(**enc, output_hidden_states=True, use_cache=False)
+    out = model(**enc, use_cache=False)
     h_all = out.hidden_states[layer_idx]            # (B, T, H)
     # last *real* token (right-padded), found via attention_mask sum - 1
     last_idx = enc["attention_mask"].sum(dim=1) - 1  # (B,)
@@ -201,11 +216,15 @@ class QwenRouter(nn.Module):
             device=self.cfg.device,
         )
 
-    def features_batch(self, contexts: list[str]) -> np.ndarray:
-        """Batched feature extraction: one Qwen3 forward over all contexts.
+    def features_batch(self, contexts: list[str], batch_size: int = 0) -> np.ndarray:
+        """Batched feature extraction: Qwen3 forward over all contexts.
 
         This is the key perf win — a batched forward is ~N times faster
         than N separate forwards for similar-length contexts.
+
+        Args:
+            contexts: list of text strings to extract features from.
+            batch_size: if >0, split into chunks of this size to avoid OOM.
         """
         self._ensure_loaded()
         if not contexts:
@@ -218,6 +237,7 @@ class QwenRouter(nn.Module):
             self._model, self._tokenizer, contexts,
             layer_idx=self.cfg.layer_idx,
             device=self.cfg.device,
+            batch_size=batch_size,
         )
 
     # ---- forward ----
