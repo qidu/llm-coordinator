@@ -39,6 +39,42 @@ ROLE_TO_IDX = {"Thinker": 0, "Worker": 1, "Verifier": 2}
 IDX_TO_ROLE = {v: k for k, v in ROLE_TO_IDX.items()}
 NUM_ROLES = 3
 
+# Default model keys for the 2-mock setup.  Override with set_model_keys().
+_DEFAULT_MODEL_KEYS = ["Model_A", "Model_B"]
+_model_keys: list[str] = list(_DEFAULT_MODEL_KEYS)
+_IDX_TO_MODEL: dict[int, str] = {i: k for i, k in enumerate(_model_keys)}
+
+
+def set_model_keys(keys: list[str]) -> None:
+    """Override model key mapping (call before training with real LLMs).
+
+    Must be called before MLPCoordinator / HeuristicCoordinator are instantiated
+    so the action<->label tables are consistent throughout a run.
+    """
+    global _model_keys, _IDX_TO_MODEL
+    _model_keys = list(keys)
+    _IDX_TO_MODEL = {i: k for i, k in enumerate(_model_keys)}
+
+
+def model_keys() -> list[str]:
+    """Current model keys list (length = n_models)."""
+    return _model_keys
+
+
+def label_to_action(model_idx: int, role_idx: int) -> tuple[str, str]:
+    """Decode router logits to (model_key, role)."""
+    return _IDX_TO_MODEL.get(model_idx, f"Model_{model_idx}"), IDX_TO_ROLE[role_idx]
+
+
+def action_to_label(model_key: str, role: str) -> tuple[int, int]:
+    """Encode (model_key, role) -> (model_idx, role_idx)."""
+    try:
+        model_idx = _model_keys.index(model_key)
+    except ValueError:
+        model_idx = 0
+    role_idx = ROLE_TO_IDX[role]
+    return model_idx, role_idx
+
 FEATURE_DIM = 16
 
 

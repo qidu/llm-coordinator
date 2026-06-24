@@ -28,7 +28,8 @@ from src.evolution import (
     recommended_pop_size,
 )
 from src.eval import compare
-from src.llm_pool import LLMPool
+from src.features import set_model_keys
+from src.llm_pool import LLMPool, make_real_pool
 from src.tasks import make_dataset
 
 
@@ -55,9 +56,43 @@ def main():
     ap.add_argument("--save", type=str, default="artifacts/router_params.json")
     ap.add_argument("--ablate", action="store_true",
                     help="run a head-architecture ablation instead of comparison")
+    ap.add_argument("--real", action="store_true",
+                    help="use real LLMs (deepseek-v4-flash + max-m3 on localhost:8788) "
+                         "instead of mocks")
+    ap.add_argument("--endpoint", type=str, default="http://localhost:8788/v1",
+                    help="API endpoint for --real mode")
+    ap.add_argument("--benchmark", type=str, default=None,
+                    choices=["math500", "mmlu", "livecodebench"],
+                    help="use a real benchmark instead of toy tasks")
+    ap.add_argument("--bench-cache", type=str, default="data",
+                    help="cache directory for benchmark downloads")
     args = ap.parse_args()
 
-    pool = LLMPool()
+    # Wire real LLMs before instantiating any coordinator.
+    if args.real:
+        pool = make_real_pool(endpoint=args.endpoint)
+        set_model_keys(pool.keys)
+        print(f"[real] pool={pool.keys}  endpoint={args.endpoint}")
+    else:
+        pool = LLMPool()
+        set_model_keys(pool.keys)
+        print(f"[mock] pool={pool.keys}")
+
+    # Wire real benchmarks if requested.
+    if args.benchmark:
+        from src.benchmarks import load_benchmark
+        train_tasks = load_benchmark(args.benchmark, cache_dir=args.bench_cache)
+        eval_tasks = load_benchmark(args.benchmark, cache_dir=args.bench_cache)
+        print(f"[benchmark] {args.benchmark}: {len(train_tasks)} train, "
+              f"{len(eval_tasks)} eval tasks")
+        # re-seed for reproducibility
+        import random
+        rng = random.Random(args.seed)
+        rng.shuffle(train_tasks)
+        rng.shuffle(eval_tasks)
+    else:
+        train_tasks = make_dataset(args.train, seed=args.seed, difficulty_range=(1, 4))
+        eval_tasks = make_dataset(args.eval, seed=args.seed + 9999, difficulty_range=(1, 5))
 
     t0 = time.time()
     best, logs, coord_cfg = train_router(
@@ -73,6 +108,8 @@ def main():
         method=args.method,
         seed=args.seed,
         save_path=args.save,
+        train_tasks=train_tasks,
+        eval_tasks=eval_tasks,
     )
     train_time = time.time() - t0
 
@@ -81,8 +118,6 @@ def main():
     print(f"Final train fitness: {logs[-1].best:.3f}")
 
     # ---- held-out evaluation ----
-    eval_tasks = make_dataset(args.eval, seed=args.seed + 9999, difficulty_range=(1, 5))
-
     def make_mlp():
         return MLPCoordinator(params=best, cfg=coord_cfg)
 

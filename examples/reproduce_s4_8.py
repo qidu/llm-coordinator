@@ -25,7 +25,8 @@ from src.evolution import (
     CMAESConfig, make_fitness_fn, random_search, sep_cma_es,
     recommended_pop_size,
 )
-from src.llm_pool import LLMPool
+from src.llm_pool import LLMPool, make_real_pool
+from src.features import set_model_keys
 from src.tasks import make_dataset
 from src.eval import evaluate
 
@@ -49,17 +50,43 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--n-seeds", type=int, default=1,
                     help="repeat with multiple seeds and average (reduces RS noise)")
+    ap.add_argument("--real", action="store_true",
+                    help="use real LLMs (deepseek-v4-flash + max-m3 on localhost:8788)")
+    ap.add_argument("--endpoint", type=str, default="http://localhost:8788/v1")
+    ap.add_argument("--benchmark", type=str, default=None,
+                    choices=["math500", "mmlu", "livecodebench"])
+    ap.add_argument("--bench-cache", type=str, default="data")
     args = ap.parse_args()
 
-    pool = LLMPool()
+    if args.real:
+        pool = make_real_pool(endpoint=args.endpoint)
+        set_model_keys(pool.keys)
+        print(f"[real] pool={pool.keys}  endpoint={args.endpoint}")
+    else:
+        pool = LLMPool()
+        set_model_keys(pool.keys)
+
+    if args.benchmark:
+        from src.benchmarks import load_benchmark
+        _all_tasks = load_benchmark(args.benchmark, cache_dir=args.bench_cache)
+        import random
+        rng = random.Random(args.seed)
+        rng.shuffle(_all_tasks)
+        print(f"[benchmark] {args.benchmark}: {len(_all_tasks)} tasks loaded")
+    else:
+        _all_tasks = None
     coord_cfg = CoordinatorConfig(head=args.head, n_blocks=5, use_argmax=args.argmax)
     init_coord = MLPCoordinator(cfg=coord_cfg)
     init = init_coord.get_params()
     d = init.size
     pop = args.pop or recommended_pop_size(d)
 
-    train_tasks = make_dataset(args.train, seed=args.seed, difficulty_range=(1, 4))
-    eval_tasks = make_dataset(args.eval, seed=args.seed + 9999, difficulty_range=(1, 5))
+    if _all_tasks is None:
+        train_tasks = make_dataset(args.train, seed=args.seed, difficulty_range=(1, 4))
+        eval_tasks = make_dataset(args.eval, seed=args.seed + 9999, difficulty_range=(1, 5))
+    else:
+        train_tasks = _all_tasks[:args.train]
+        eval_tasks = _all_tasks[args.train:args.train + args.eval]
     fit_fn = make_fitness_fn(train_tasks, pool, max_turns=args.max_turns, coord_cfg=coord_cfg)
 
     print(f"Head: {args.head} (d={d} params, pop={pop}, gens={args.gens}, "
@@ -72,8 +99,16 @@ def main():
     for seed_idx in range(args.n_seeds):
         seed = args.seed + seed_idx * 1000
         print(f"\n=== seed {seed} ===")
-        train_tasks_s = make_dataset(args.train, seed=seed, difficulty_range=(1, 4))
-        eval_tasks_s = make_dataset(args.eval, seed=seed + 9999, difficulty_range=(1, 5))
+        if _all_tasks is not None:
+            import random
+            rng = random.Random(seed)
+            tasks_copy = list(_all_tasks)
+            rng.shuffle(tasks_copy)
+            train_tasks_s = tasks_copy[:args.train]
+            eval_tasks_s = tasks_copy[:args.train + args.eval][args.train:]
+        else:
+            train_tasks_s = make_dataset(args.train, seed=seed, difficulty_range=(1, 4))
+            eval_tasks_s = make_dataset(args.eval, seed=seed + 9999, difficulty_range=(1, 5))
         fit_fn_s = make_fitness_fn(train_tasks_s, pool, max_turns=args.max_turns,
                                    coord_cfg=coord_cfg)
 

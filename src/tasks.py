@@ -172,27 +172,46 @@ def extract_final_answer(text: str) -> str | None:
     """Pull the worker's committed answer from its output.
 
     Priority:
-        1. text after 'FINAL:' (case-insensitive)
-        2. last number in the text
+        1. text after 'FINAL:' (TRINITY role convention)
+        2. \\boxed{...} (MATH benchmark convention)
+        3. last line matching A / B / C / D (MMLU convention)
+        4. last number in the text (numeric tasks)
+        5. boolean (logic tasks)
+        6. last non-empty line (code tasks)
     """
     if not text:
         return None
+    # 1. TRINITY FINAL: convention
     m = re.search(r"final\s*[:=]\s*([^\n]+)", text, re.IGNORECASE)
     if m:
         return m.group(1).strip().rstrip(".")
+    # 2. \boxed{...}  (MATH)
+    m = re.search(r"\\boxed\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}", text)
+    if m:
+        return m.group(1).strip()
+    # 3. MMLU multiple choice (A/B/C/D on its own line)
+    choice_match = re.search(r"^\s*([ABCD])\s*$", text, re.MULTILINE)
+    if choice_match:
+        return choice_match.group(1).strip()
+    # also catch "The answer is (B)" style
+    m = re.search(r"\b(?:answer|choice)\s*[:=]\s*([A-D])\b", text, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    # 4. last number (numeric tasks)
     nums = _NUM_RE.findall(text)
     if nums:
         return nums[-1]
-    # boolean fallback
+    # 5. boolean (logic tasks)
     low = text.lower()
     if "true" in low and "false" not in low:
         return "True"
     if "false" in low and "true" not in low:
         return "False"
-    stripped = text.strip()
-    if not stripped:
-        return None
-    return stripped.splitlines()[-1].strip()
+    # 6. last non-empty line (code tasks — return last line of code)
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if lines:
+        return lines[-1]
+    return None
 
 
 def is_correct(task: Task, response: str) -> bool:

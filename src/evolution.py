@@ -273,7 +273,10 @@ def train_router(pool: LLMPool, n_train: int = 16, n_eval: int = 32,
                  head: str = "block_diag", n_blocks: int = 5,
                  use_argmax: bool = True,
                  method: str = "cma",
-                 save_path: str | None = None) -> tuple[np.ndarray, list[GenerationLog], "CoordinatorConfig"]:
+                 save_path: str | None = None,
+                 train_tasks: list[Task] | None = None,
+                 eval_tasks: list[Task] | None = None,
+                 ) -> tuple[np.ndarray, list[GenerationLog], "CoordinatorConfig"]:
     """Train a router with sep-CMA-ES (or RS baseline) on synthetic tasks."""
     from .coordinator import MLPCoordinator, CoordinatorConfig
     coord_cfg = CoordinatorConfig(
@@ -287,11 +290,16 @@ def train_router(pool: LLMPool, n_train: int = 16, n_eval: int = 32,
     d = init.size
     if pop_size is None:
         pop_size = recommended_pop_size(d)
+
+    if train_tasks is None:
+        train_tasks = make_dataset(n_train, seed=seed, difficulty_range=(1, 4))
+    if eval_tasks is None:
+        eval_tasks = make_dataset(n_eval, seed=seed + 9999, difficulty_range=(1, 5))
+
     print(f"Training {head} router ({n_blocks} blocks, argmax={use_argmax}, "
-          f"d={d} params): pop={pop_size}, gen={generations}, tasks={n_train}, "
+          f"d={d} params): pop={pop_size}, gen={generations}, tasks={len(train_tasks)}, "
           f"max_turns={max_turns}, method={method}")
 
-    train_tasks = make_dataset(n_train, seed=seed, difficulty_range=(1, 4))
     fit_fn = make_fitness_fn(train_tasks, pool, max_turns=max_turns, coord_cfg=coord_cfg)
     logs: list[GenerationLog] = []
 

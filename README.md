@@ -75,8 +75,9 @@ If `python examples/reproduce_s4_8.py` doesn't print numbers, jump to **Setup** 
 
 | Module | What it does |
 |---|---|
-| `src/tasks.py` | Toy tasks (arithmetic / logic / string / two-step) with verifiable answers |
-| `src/llm_pool.py` | `MockSmallLLM` (80% reliable) and `MockStrongLLM` (98% reliable) — `LLM` Protocol interface for plugging in real LLMs |
+| `src/tasks.py` | Toy tasks (arithmetic / logic / string / two-step) with verifiable answers; `extract_final_answer()` handles FINAL:, `\boxed{}`, A/B/C/D, numeric, boolean formats |
+| `src/benchmarks.py` | Load MATH500, MMLU, LiveCodeBench from HuggingFace into `Task` objects |
+| `src/llm_pool.py` | Mock LLMs (small/strong) + `OpenAICompatibleLLM` + `make_real_pool()` for OpenAI-compatible endpoints |
 | `src/features.py` | 16-dim transcript feature vector (turn #, last role, reject count, etc.) |
 | `src/heads.py` | **4 paper-faithful head architectures** (Appendix A.4): Linear, Low-rank, Sparse, **Block-diagonal** + a generic MLP |
 | `src/coordinator.py` | `HeuristicCoordinator`, `MLPCoordinator` (any head), `QwenCoordinator` (optional) |
@@ -153,6 +154,10 @@ python examples/reproduce_s4_8.py --gens 20 --train 24 --n-seeds 3
 python examples/run_qwen.py                    # single forward pass
 python examples/train_qwen.py                  # train one head via sep-CMA-ES
 python examples/ablate_qwen_heads.py --help    # full 5-head ablation
+
+# Real LLMs + real benchmarks (needs OpenAI-compatible endpoint)
+python examples/train_router.py --real --endpoint http://localhost:8788/v1 --benchmark math500
+python examples/reproduce_s4_8.py --real --endpoint http://localhost:8788/v1 --benchmark mmlu
 ```
 
 ### Sample run — head-architecture ablation (default settings)
@@ -215,9 +220,9 @@ learns to stop as soon as it has a good answer.
 | SLM backbone | Qwen3-0.6B + SVF (9,216 trainable params) | `QwenRouter` (frozen Qwen3-0.6B + trainable head) via `examples/train_qwen.py` / `ablate_qwen_heads.py` | ✅ |
 | Head | 4 architectures + argmax/softmax | All 4 implemented + argmax; also MLP for toy regime | ✅ |
 | Population size | $\lceil 4 + 3 \ln n \rceil$ (32 for n=10K) | `recommended_pop_size` in `src/evolution.py:264` — exact formula | ✅ |
-| Model pool | 7 real LLMs (GPT-5, Gemini-2.5-Pro, Claude-4, Gemma-3-27B, DeepSeek-R1-Distill-32B, Qwen3-32B x2) | 2 mocks (small, strong) — `LLM` Protocol in `src/llm_pool.py` ready for real LLMs; hardcoded 2-model assumptions in `features.py` / `coordinator.py` need updating | 🔧 |
-| $n_a$ | 10 (7 models + 3 roles) | 5 (2 models + 3 roles) | 🔧 |
-| Real benchmarks | MATH500, MMLU, RLPR, LiveCodeBench | Toy suite (arithmetic, logic, string) — `Task` abstraction in `src/tasks.py` is benchmark-agnostic; needs dataset loaders | 🔧 |
+| Model pool | 7 real LLMs (GPT-5, Gemini-2.5-Pro, Claude-4, Gemma-3-27B, DeepSeek-R1-Distill-32B, Qwen3-32B x2) | 2 mocks (small, strong) — `OpenAICompatibleLLM` + `make_real_pool()` in `src/llm_pool.py`; use `--real --endpoint http://localhost:8788/v1` on `train_router.py` / `reproduce_s4_8.py` | ✅ |
+| $n_a$ | 10 (7 models + 3 roles) | Default 5 (2 models + 3 roles); `set_model_keys()` in `src/features.py` makes $n_a$ configurable — call with 7 model keys to get $n_a=10$ | ✅ |
+| Real benchmarks | MATH500, MMLU, RLPR, LiveCodeBench | `src/benchmarks.py` loaders for MATH500, MMLU, LiveCodeBench; use `--benchmark math500` on `train_router.py` / `reproduce_s4_8.py` | ✅ |
 | sep-CMA-ES | ✅ | ✅ | — |
 | Random Search baseline (S4.8) | ✅ (Table 4) | ✅ (implemented, reproduced) | — |
 | REINFORCE baseline | ✅ | ❌ (could add as future) | — |
@@ -225,7 +230,7 @@ learns to stop as soon as it has a good answer.
 
 **Legend:** ✅ = matches paper, 🔧 = fixable with moderate effort, ❌ = not implemented
 
-The three 🔧 gaps are all structurally feasible: the abstractions are in place (Protocol interface for real LLMs, `Task` objects for benchmarks, configurable `n_outputs` for action space). The remaining work is data loading and removing the 2-model hardcodes.
+The remaining ❌ gaps (REINFORCE, SFT baselines) require fundamentally different training pipelines and are left as future work.
 
 ## File map
 
@@ -236,14 +241,15 @@ The three 🔧 gaps are all structurally feasible: the abstractions are in place
 ├── notes/paper_summary.md       # paper notes (verified against arXiv:2512.04695v3)
 ├── src/
 │   ├── __init__.py
-│   ├── tasks.py                  # toy tasks + answer matching
-│   ├── llm_pool.py               # mock LLMs
+│   ├── tasks.py                  # toy tasks + answer matching + extract_final_answer()
+│   ├── llm_pool.py               # mock LLMs + OpenAICompatibleLLM / make_real_pool()
 │   ├── features.py               # 16-dim transcript features
 │   ├── heads.py                  # 4 paper head architectures + MLP
 │   ├── coordinator.py            # heuristic / MLP coordinators
 │   ├── qwen_router.py           # Qwen3-0.6B backbone + trainable head
 │   ├── trinity_system.py         # Section 3.2 state machine
 │   ├── evolution.py              # sep-CMA-ES + RS baseline
+│   ├── benchmarks.py             # MATH500, MMLU, LiveCodeBench → Task objects
 │   └── eval.py                   # comparison harness
 ├── tests/
 │   └── test_smoke.py             # 19 tests

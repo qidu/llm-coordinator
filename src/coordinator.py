@@ -23,6 +23,7 @@ from .features import (
     action_to_label,
     extract_features,
     label_to_action,
+    model_keys,
 )
 from .heads import HeadConfig, make_head
 
@@ -35,21 +36,25 @@ class HeuristicCoordinator:
     """Same state machine as the hand-coded OpenAI prototype.
 
     Pattern: start with Thinker -> Worker -> Verifier -> (loop on REVISE).
+    Uses model_keys() from features.py so it works with 2 mocks or N real LLMs.
     """
 
     def __init__(self):
         self.history: list[str] = []
+        keys = model_keys()
+        self._worker = keys[0] if len(keys) > 0 else "Model_A"
+        self._strong = keys[-1] if len(keys) > 0 else "Model_B"
 
     def route(self, turn: int, transcript: list[dict], task=None,
               max_turns: int = 6) -> tuple[str, str]:
         if turn == 1 or not self.history:
-            choice = ("Model_B", "Thinker")
+            choice = (self._strong, "Thinker")
         elif self.history[-1] == "Thinker":
-            choice = ("Model_A", "Worker")
+            choice = (self._worker, "Worker")
         elif self.history[-1] == "Worker":
-            choice = ("Model_B", "Verifier")
+            choice = (self._strong, "Verifier")
         else:  # Verifier -> REVISE -> back to Thinker
-            choice = ("Model_B", "Thinker")
+            choice = (self._strong, "Thinker")
         self.history.append(choice[1])
         return choice
 
@@ -64,9 +69,9 @@ class HeuristicCoordinator:
 @dataclass
 class CoordinatorConfig:
     in_dim: int = FEATURE_DIM
-    n_models: int = 2       # L
+    n_models: int = 2       # L  (overridden at runtime by len(model_keys()))
     n_roles: int = NUM_ROLES  # 3
-    n_outputs: int = 5      # n_a = L + 3
+    n_outputs: int = 5      # n_a = L + 3  (overridden at runtime by len(model_keys()) + n_roles)
     hidden: int = 32        # used by low_rank and mlp
     head: str = "block_diag"  # linear / low_rank / sparse / block_diag / mlp
     n_blocks: int = 5       # for block_diag; set to n_outputs for full block-diag
@@ -86,9 +91,11 @@ class MLPCoordinator:
     def __init__(self, params: np.ndarray | None = None,
                  cfg: CoordinatorConfig | None = None):
         self.cfg = cfg or CoordinatorConfig()
+        # n_outputs adapts to the number of model keys set at runtime.
+        n_outputs = len(model_keys()) + NUM_ROLES
         head_cfg = HeadConfig(
             in_dim=self.cfg.in_dim,
-            n_outputs=self.cfg.n_outputs,
+            n_outputs=n_outputs,
             hidden=self.cfg.hidden,
             kind=self.cfg.head,
             n_blocks=self.cfg.n_blocks,
@@ -125,7 +132,8 @@ class MLPCoordinator:
         x = torch.from_numpy(extract_features(transcript, task, max_turns)).unsqueeze(0)
         z = self.head(x).squeeze(0)  # (n_a,)
         z = z / max(self.cfg.temperature, 1e-3)
-        n_models = self.cfg.n_models
+        # Use len(model_keys()) at runtime so n_models adapts if keys change.
+        n_models = len(model_keys())
         model_logits = z[:n_models]
         role_logits = z[n_models:]
         if self.cfg.use_argmax:
