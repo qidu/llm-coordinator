@@ -39,6 +39,10 @@ def main():
     ap.add_argument("--eval", type=int, default=16)
     ap.add_argument("--max-turns", type=int, default=4)
     ap.add_argument("--method", default="cma", choices=["cma", "rs"])
+    ap.add_argument("--layers", default="-2",
+                    help="Comma-separated negative layer indices to concat. "
+                         "Default '-2' (paper). Try '-2,-4' or '-2,-4,-6' to "
+                         "boost the routing signal with multi-layer features.")
     ap.add_argument("--no-batched", action="store_true",
                     help="Disable the batched fitness path (slower but "
                          "byte-for-byte identical to the naive per-candidate loop).")
@@ -53,6 +57,9 @@ def main():
                     help="head architectures to compare")
     ap.add_argument("--save", default="artifacts/qwen_head_ablation.json")
     args = ap.parse_args()
+
+    # Parse --layers: "-2" -> (-2,), "-2,-4" -> (-2, -4)
+    layer_idxs = tuple(int(x) for x in args.layers.split(","))
 
     pool = LLMPool()
     models = pool.keys
@@ -71,6 +78,7 @@ def main():
             n_outputs=n_outputs,
             use_argmax=False,
             deterministic=True,
+            layer_idxs=layer_idxs,
             device=args.device,
             dtype={"float32": torch.float32, "float16": torch.float16,
                    "bfloat16": torch.bfloat16}[args.dtype],
@@ -154,7 +162,8 @@ def main():
         json.dump({"results": results, "best": best_head,
                    "gens": args.gens, "train": args.train,
                    "eval": args.eval, "method": args.method,
-                   "model": args.model}, f, indent=2)
+                   "model": args.model,
+                   "layer_idxs": list(layer_idxs)}, f, indent=2)
     print(f"\nSaved to {args.save}")
 
 

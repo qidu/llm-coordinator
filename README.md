@@ -19,8 +19,12 @@ source ~/venvs/headroom/bin/activate          # or create it (see Setup below)
 pip install -r requirements.txt
 huggingface-cli download Qwen/Qwen3-0.6B-Base
 
-# 3. Run the tests — you should see 19/19 PASS
-python tests/test_smoke.py
+# 3. Run the tests
+#   test_no_qwen.py — 20 tests, no backbone download required
+python tests/test_no_qwen.py     # → 20/20 PASS  (always, even without Qwen download)
+#   test_smoke.py   —  5 tests, needs Qwen3-0.6B-Base (~1.2GB)
+python tests/test_smoke.py         # →  5/5 PASS  (after download)
+                                # →  0/5 PASS, 5 SKIP  (before download, exit 0)
 
 # 4. Reproduce the paper's main result (~1 min)
 python examples/reproduce_s4_8.py
@@ -85,6 +89,7 @@ If `python examples/reproduce_s4_8.py` doesn't print numbers, jump to **Setup** 
 | `src/trinity_system.py` | The Section 3.2 state machine: per turn, coordinator picks `(model, role)`, the LLM answers, verifier may terminate |
 | `src/evolution.py` | **sep-CMA-ES** (pure NumPy, ~150 LOC) + **Random Search baseline** (paper S4.8) — `recommended_pop_size` implements the paper's $\lceil 4 + 3\ln n \rceil$ formula |
 | `src/eval.py` | Compare two coordinators on a task batch |
+| `src/qwen_router.py` (additions) | **`SVFLinear`** — paper-faithful SVD-based fine-tuning of selected weight matrices (U, V frozen; only top-r singular values trainable). **`attach_svf()`** injects SVF into the last N transformer blocks' `q_proj` to match the paper's 9,216-parameter backbone-tuning budget. **`extract_hidden_state_multi()`** concatenates last-token hidden states from multiple layers (`layer_idxs=(-2,-4)`) for richer routing signal. |
 
 ## Head architectures (Appendix A.4)
 
@@ -134,8 +139,10 @@ The first time `QwenRouter` is constructed it will load these weights into the c
 ## How to run
 
 ```bash
-# smoke tests (19/19)
-python tests/test_smoke.py
+# smoke tests (split by Qwen requirement — runner exits 0 even when SKIP)
+python tests/test_no_qwen.py    # 20 tests, no download → 20/20 PASS
+python tests/test_smoke.py      #  5 tests, needs Qwen3-0.6B-Base → 5/5 PASS (after download)
+                                #                              → 0/5 PASS, 5 SKIP (before download, exit 0)
 
 # heuristic baseline
 python examples/run_heuristic.py
@@ -252,7 +259,8 @@ The remaining ❌ gaps (REINFORCE, SFT baselines) require fundamentally differen
 │   ├── benchmarks.py             # MATH500, MMLU, LiveCodeBench → Task objects
 │   └── eval.py                   # comparison harness
 ├── tests/
-│   └── test_smoke.py             # 19 tests
+│   ├── test_no_qwen.py     # 20 tests, no backbone download (fast feedback)
+│   └── test_smoke.py       #  5 tests, needs Qwen3-0.6B-Base downloaded
 ├── examples/
 │   ├── run_heuristic.py
 │   ├── train_router.py
@@ -266,3 +274,69 @@ The remaining ❌ gaps (REINFORCE, SFT baselines) require fundamentally differen
 └── notes/
     └── paper_summary.md
 ```
+
+## What's new (v0.2 — promotion over Qwen3-0.6B)
+
+Two new directions to attack the "linear wins at 0.6B" finding (README §Honest gaps):
+
+### 1. Multi-layer feature concat (`layer_idxs`)
+
+```python
+cfg = QwenCoordinatorConfig(
+    head="block_diag",
+    layer_idxs=(-2, -4),  # concat h_{-2} and h_{-4} → 2048-dim feature
+    n_outputs=6,
+)
+# or via CLI:
+python examples/ablate_qwen_heads.py --layers -2,-4 --heads linear block_diag
+```
+
+The `linear_idxs` config key now accepts a tuple — hidden states from each
+requested layer are concatenated along the feature dim, automatically growing
+the head's `in_dim`. This boosts the routing signal without adding any
+backbone parameters.
+
+### 2. SVF (Singular Value Fine-tuning) — paper-faithful backbone tuning
+
+```python
+cfg = QwenCoordinatorConfig(
+    head="block_diag",
+    use_svf=True,           # ← new
+    svf_rank=1024,          # top-r singular values per matrix
+    svf_n_blocks=9,         # last 9 blocks' q_proj → 9 * 1024 = 9,216 trainable
+    n_outputs=6,
+)
+# Run the head ablation with vs without SVF, side-by-side:
+python examples/compare_with_svf.py --heads linear block_diag --device mps
+```
+
+`SVFLinear` is a drop-in replacement for `nn.Linear`: the weight matrix
+W = U·diag(σ)·V^T is decomposed via SVD, U and V are frozen, and only the
+top-r singular-value scales `σ·(1+δ)` are trainable. At δ=0 the layer is
+exactly the original `nn.Linear` — so SVF training is a strict perturbation
+around the pretrained backbone, with the paper's exact parameter count
+(9,216 = 9 matrices × 1024 top singular values).
+
+The full param budget per coordinator is then `head (~10K) + SVF (9,216) ≈ 20K`,
+matching the paper's `~20K trainable params per coordinator`.
+
+### New tests
+
+6 new tests added (25 total, was 19, then split into two files):
+
+`test_no_qwen.py` (20 tests, no backbone needed — fast):
+- `test_task_generation`, `test_extract_final`, `test_is_correct`, `test_features_shape`
+- `test_heuristic_runs`, `test_mlp_coord_runs`, `test_mlp_param_io`, `test_dataset`
+- `test_head_architectures`, `test_mlp_with_different_heads`, `test_argmax_vs_softmax`
+- `test_recommended_pop_size`, `test_random_search_runs`
+- `test_qwen_router_with_fake_backbone`, `test_qwen_router_multi_layer_concat`
+- `test_svf_linear_initial_equals_base`, `test_svf_linear_perturbation_changes_output`,
+  `test_svf_linear_uses_only_top_r_singular_values`, `test_attach_svf_wraps_last_n_blocks`,
+  `test_qwen_router_svf_param_count_and_roundtrip`
+
+`test_smoke.py` (5 tests, needs Qwen3-0.6B-Base ~1.2GB):
+- `test_qwen_router_loads_and_features`
+- `test_extract_hidden_state_batch`
+- `test_batched_fitness_matches_naive`
+- `test_batched_fitness_shape`
+- `test_set_params_dtype_preservation`

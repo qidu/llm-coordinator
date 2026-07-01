@@ -1,15 +1,15 @@
 {
   "cma": {
-    "acc_mean": 0.975,
+    "acc_mean": 0.0,
     "acc_std": 0.0,
     "turns": 5.0,
-    "time": 0.6151673793792725
+    "time": 960.5743174552917
   },
   "rs": {
-    "acc_mean": 0.875,
+    "acc_mean": 0.0,
     "acc_std": 0.0,
     "turns": 5.0,
-    "time": 1.1246767044067383
+    "time": 1935.6420056819916
   },
   "n_seeds": 1,
   "head": "block_diag"
